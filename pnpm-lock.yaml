@@ -5243,6 +5243,28 @@ importers:
         specifier: workspace:^
         version: link:../../util/timeout
 
+  packages/llm/llm-deepseek-web:
+    dependencies:
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../vendor/schemastery
+        version: link:../../../vendor/schemastery
+      ws:
+        specifier: ^8.21.0
+        version: 8.21.0
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: workspace:^
+        version: link:../../../vendor/cordis
+      '@deepseek-ai/dsh-llm':
+        specifier: workspace:^
+        version: link:../llm
+      '@deepseek-ai/dsh-settings':
+        specifier: workspace:^
+        version: link:../../settings/settings
+      '@types/ws':
+        specifier: ^8.5.12
+        version: 8.18.1
+
   packages/llm/llm-pi-ai:
     dependencies:
       '@deepseek-ai/schemastery':

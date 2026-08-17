@@ -1,0 +1,330 @@
+/**
+ * The script injected into chat.deepseek.com.
+ *
+ * Every selector here comes from a content script that has been driving this
+ * page in production, not from guesswork — the site ships obfuscated class
+ * names, so the fallback chains matter more than any single selector.
+ *
+ * Evaluated before each operation and idempotent, because a navigation wipes
+ * whatever the previous evaluation defined.
+ *
+ * @module @deepseek-ai/dsh-llm-deepseek-web/page-agent
+ */
+
+/** Snapshot of the page as the driver sees it between polls. */
+export interface PageSnapshot {
+  loggedIn: boolean
+  hasInput: boolean
+  /** Body text of the newest assistant reply; empty until one exists. */
+  text: string
+  /** Non-empty message bubbles *currently rendered* — a virtual list, so not a total. */
+  count: number
+  /** Best-effort "still producing" signal; reply completion does not rely on it. */
+  generating: boolean
+  /** Page text matched an upload/parse failure hint. */
+  failed: string
+  /** An attachment is still uploading or parsing. */
+  busy: boolean
+}
+
+/**
+ * Installs `window.__dshWeb`. Safe to evaluate repeatedly.
+ */
+export const PAGE_AGENT = String.raw`
+(() => {
+  const INPUT_SELECTORS = [
+    'textarea[placeholder*="Message DeepSeek"]',
+    'textarea[placeholder*="给 DeepSeek"]',
+    'textarea[placeholder*="DeepSeek"]',
+    'textarea[placeholder*="发送"]',
+    'textarea[name="search"]',
+    '#chat-input',
+    'textarea',
+  ];
+  const SEND_SELECTORS = [
+    'button[aria-label*="发送"]',
+    'button[aria-label*="Send"]',
+    'button[type="submit"]',
+    'div[role="button"][aria-label*="发送"]',
+    'div[role="button"][aria-label*="Send"]',
+  ];
+  // 消息条目本身的 class 是混淆值(_9663006 之类),会随发版变化,只能靠位置取。
+  // 容器 class 是语义化的,相对稳定。旧版结构留作兜底。
+  const MESSAGE_CONTAINER = '.ds-virtual-list-visible-items';
+  // 助手回复的正文节点,实际 class 是 'ds-markdown ds-assistant-message-main-content'。
+  const REPLY_BODY = '.ds-markdown';
+  const ASSISTANT_SELECTORS = ['.ds-markdown', '.markdown-body', '[class*="markdown"]'];
+  const LOGIN_HINT = /登录|sign in|log in|驗證|验证码/i;
+  const FAIL_HINT = /解析失败|未能发送|发送失败|upload failed|parse failed/i;
+  const BUSY_HINT = /解析中|上传中|处理中|Uploading|Parsing|Loading/i;
+
+  function findInput() {
+    for (const s of INPUT_SELECTORS) {
+      const el = document.querySelector(s);
+      if (el instanceof HTMLTextAreaElement) return el;
+    }
+    return null;
+  }
+
+  /** 输入框往上数几层,把搜索范围收在输入区内,避免误点侧边栏的控件。 */
+  function composerBox() {
+    const input = findInput();
+    if (!input) return null;
+    let box = input;
+    for (let i = 0; i < 6 && box.parentElement; i++) box = box.parentElement;
+    return box;
+  }
+
+  function findSendButton() {
+    // 站点已无 <button>,发送键是输入区里那个没有 aria-label 的 primary 图标按钮。
+    // ds-button--primary 是语义 class,比条目上那些混淆 class 稳。
+    const box = composerBox();
+    if (box) {
+      const primary = Array.from(box.querySelectorAll('[role="button"]'))
+        .filter((el) => /ds-button--primary/.test(String(el.className || '')))
+        .filter((el) => el.getBoundingClientRect().width > 0);
+      if (primary.length) return primary[primary.length - 1];
+    }
+    for (const s of SEND_SELECTORS) {
+      const el = document.querySelector(s);
+      if (el instanceof HTMLElement && !el.disabled) return el;
+    }
+    const root = box || document.body;
+    const buttons = Array.from(root.querySelectorAll('button, div[role="button"]'));
+    const byLabel = buttons.find((b) => {
+      const t = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+      return /发送|Send|提交/i.test(t) && !b.disabled;
+    });
+    return byLabel || null;
+  }
+
+  /**
+   * 最新一条助手回复的正文。
+   *
+   * 只能读正文节点,不能读整条气泡的 innerText:气泡里还有站点自己的状态文字
+   * (读附件时的「正在阅读」)和底部那排操作按钮,整条读会把它们当成模型输出,
+   * 上游看到的就是以「正在阅读」开头的回答。
+   * 没有正文节点就返回空 —— 那正是「站点还在忙、回答尚未开始」的状态。
+   */
+  function replyText() {
+    const nodes = document.querySelectorAll(REPLY_BODY);
+    if (!nodes.length) return '';
+    return ((nodes[nodes.length - 1].innerText) || '').trim();
+  }
+
+  function messageTexts() {
+    const container = document.querySelector(MESSAGE_CONTAINER);
+    if (container) {
+      return Array.from(container.children)
+        .map((el) => (el.innerText || '').trim())
+        .filter(Boolean);
+    }
+    const out = [];
+    for (const sel of ASSISTANT_SELECTORS) {
+      document.querySelectorAll(sel).forEach((n) => {
+        const t = (n.innerText || '').trim();
+        if (t) out.push(t);
+      });
+      if (out.length) break;
+    }
+    return out;
+  }
+
+  // 站点已经不用 <button> 了(全是 [role=button]),所以这里放宽匹配。
+  // 仅作报活提示用,回复是否结束由文本稳定性判断,不依赖它。
+  function isGenerating() {
+    const nodes = Array.from(document.querySelectorAll('[role="button"], button'));
+    return nodes.some((b) => /停止|Stop generating|停止生成|Stop/i.test(
+      b.getAttribute('aria-label') || b.textContent || ''));
+  }
+
+  function isLoggedIn() {
+    if (findInput()) return true;
+    const body = (document.body && document.body.innerText ? document.body.innerText.slice(0, 2000) : '');
+    if (LOGIN_HINT.test(body)) return false;
+    if (document.querySelector('input[type="password"], .ds-sign-in-form__main, .ds-auth-form-wrapper')) return false;
+    return Boolean(findInput());
+  }
+
+  function fileInputSelector() {
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    const hit = inputs.find((i) => !i.disabled && (i.accept === '' || /pdf|text|md|\*/i.test(i.accept))) || inputs[0];
+    if (!hit) return '';
+    if (!hit.dataset.dshWeb) hit.dataset.dshWeb = '1';
+    return 'input[type="file"][data-dsh-web="1"]';
+  }
+
+  function clickAttachButton() {
+    const labeled = document.querySelector('button[aria-label*="Upload"], button[aria-label*="上传"], button[aria-label*="Attach"], button[aria-label*="附件"], button[aria-label*="file" i]');
+    if (labeled instanceof HTMLElement) { labeled.click(); return true; }
+    const hit = Array.from(document.querySelectorAll('button')).find((b) =>
+      /上传|附件|Attach|Upload|文件/i.test(b.getAttribute('aria-label') || b.textContent || ''));
+    if (hit instanceof HTMLElement) { hit.click(); return true; }
+    return false;
+  }
+
+  /**
+   * 在页面内等待条件成立。等待留在页面里,CDP 只发一次调用:
+   * 既没有每次检查的往返开销,条件一成立也立刻返回,不用等下一个轮询周期。
+   * 超时返回 false 而不是抛错,由调用方决定怎么退让。
+   */
+  function waitUntil(check, timeoutMs) {
+    return new Promise((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+      const tick = () => {
+        let ok = false;
+        try { ok = Boolean(check()); } catch (e) { ok = false; }
+        if (ok) return resolve(true);
+        if (Date.now() > deadline) return resolve(false);
+        setTimeout(tick, 50);
+      };
+      tick();
+    });
+  }
+
+  window.__dshWeb = {
+    /**
+     * 开始把页面变化推给驱动方,取代外部轮询。
+     *
+     * MutationObserver 看到变化就调 __dshEmit(由 CDP 的 Runtime.addBinding 注入),
+     * 驱动方收到 Runtime.bindingCalled 事件。流式输出每秒会产生大量 mutation,
+     * 所以在页面内合并成最多每 EMIT_THROTTLE_MS 一次,避免把连接淹掉。
+     */
+    startWatch(throttleMs) {
+      if (window.__dshWatch) return true;
+      if (typeof window.__dshEmit !== 'function') return false;
+      let timer = null;
+      const flush = () => {
+        timer = null;
+        try { window.__dshEmit(JSON.stringify(window.__dshWeb.snapshot())); } catch (e) { /* 连接已断 */ }
+      };
+      const schedule = () => { if (timer === null) timer = setTimeout(flush, throttleMs); };
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+      window.__dshWatch = observer;
+      schedule();
+      return true;
+    },
+
+    stopWatch() {
+      if (window.__dshWatch) { window.__dshWatch.disconnect(); window.__dshWatch = null; }
+      return true;
+    },
+
+    /** 等输入框出现(页面加载完成的实际判据)。 */
+    waitInput(timeoutMs) {
+      return waitUntil(() => findInput(), timeoutMs);
+    },
+
+    /**
+     * 等发送键从禁用变为可用:composer 的 React 状态跟上输入之后才会亮。
+     *
+     * 判据只能看 class。发送键是 div[role=button],el.disabled 恒为 undefined、
+     * aria-disabled 恒为 null —— 拿这两个当判据等于没有判据,会立刻放行,
+     * 回车打在还禁用的按钮上,消息发不出去。
+     * (注意:本文件是 String.raw 模板,注释里不能出现反引号。)
+     */
+    waitSendable(timeoutMs) {
+      return waitUntil(() => {
+        const btn = findSendButton();
+        if (!btn) return false;
+        if (btn.disabled) return false;
+        if (btn.getAttribute('aria-disabled') === 'true') return false;
+        return !/ds-button--disabled/.test(String(btn.className || ''));
+      }, timeoutMs);
+    },
+
+    /** 等输入框清空,这是消息确实发出去的标志。 */
+    waitSubmitted(timeoutMs) {
+      return waitUntil(() => {
+        const el = findInput();
+        return el && !el.value.trim();
+      }, timeoutMs);
+    },
+
+    snapshot() {
+      const texts = messageTexts();
+      const body = (document.body && document.body.innerText) || '';
+      const failMatch = body.match(FAIL_HINT);
+      return {
+        loggedIn: isLoggedIn(),
+        hasInput: Boolean(findInput()),
+        text: replyText(),
+        count: texts.length,
+        generating: isGenerating(),
+        failed: failMatch ? failMatch[0] : '',
+        busy: BUSY_HINT.test(body),
+      };
+    },
+
+    /**
+     * 对齐「深度思考 / 智能搜索」开关。
+     * 智能搜索默认是开的,每轮都会先联网搜一遍,首字延迟能到 30 秒以上;
+     * dsh 自己带工具,这一层搜索是纯粹的浪费。用 aria-pressed 读状态,
+     * 它是标准属性,比混淆 class 稳。
+     */
+    setModes(want) {
+      const out = {};
+      for (const el of document.querySelectorAll('.ds-toggle-button, [aria-pressed]')) {
+        const label = (el.innerText || '').trim();
+        let target = null;
+        if (/深度思考|深度|Think|R1/i.test(label)) target = want.thinking;
+        else if (/智能搜索|联网|Search/i.test(label)) target = want.search;
+        if (target === null || target === undefined) continue;
+        const on = el.getAttribute('aria-pressed') === 'true';
+        if (on !== target) el.click();
+        out[label] = target;
+      }
+      return out;
+    },
+
+    /** 聚焦输入框,后续文本与回车由 CDP 以真实输入事件送入。 */
+    focusInput() {
+      const el = findInput();
+      if (!el) return false;
+      el.focus();
+      return true;
+    },
+
+    /**
+     * 发送键的视口中心坐标,供 CDP 派发真实鼠标事件。
+     * 站点用 React 合成事件,元素上的 el.click() 是 untrusted 的,
+     * 真实按下/释放更接近用户操作,也不依赖焦点还在输入框上。
+     */
+    sendButtonPoint() {
+      const btn = findSendButton();
+      if (!btn) return null;
+      const r = btn.getBoundingClientRect();
+      if (!r.width || !r.height) return null;
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    },
+
+    /** 兜底提交:真实点击也不成时,退回元素自身的 click()。 */
+    clickSend() {
+      const btn = findSendButton();
+      if (!btn) return false;
+      btn.click();
+      return true;
+    },
+
+    inputValue() {
+      const el = findInput();
+      return el ? el.value : '';
+    },
+
+    prepareFileInput() {
+      let selector = fileInputSelector();
+      if (!selector) { clickAttachButton(); selector = fileInputSelector(); }
+      return selector;
+    },
+
+    notifyFileAttached() {
+      const el = document.querySelector('input[type="file"][data-dsh-web="1"]');
+      if (!el) return false;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    },
+  };
+  return true;
+})()
+`
