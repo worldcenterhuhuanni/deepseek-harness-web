@@ -8,7 +8,7 @@
  * @module @deepseek-ai/dsh-llm-deepseek-web/session
  */
 
-import { CdpConnection, createTarget, listTargets, type CdpTarget } from './cdp.ts'
+import { CdpConnection, CdpError, closeTarget, createTarget, listTargets, type CdpTarget } from './cdp.ts'
 import { defaultUserDataDir, ensureChrome } from './launch.ts'
 import { PAGE_AGENT, type PageSnapshot } from './page-agent.ts'
 import { CompletionStreamDecoder, type StreamEvent } from './sse.ts'
@@ -43,6 +43,18 @@ export type BridgeEvent =
    */
   | { kind: 'diagnostic'; text: string }
 
+/** A tab ready for one turn, with whether it already sits on a blank conversation. */
+interface ResolvedTab {
+  target: CdpTarget
+  /** True when the page is not inside a conversation, so `newChat` needs no navigation. */
+  blank: boolean
+}
+
+/** Whether a tab URL is the composer with no conversation open. */
+function isBlankConversation(url: string): boolean {
+  return !url.includes('/a/chat/s/')
+}
+
 /** A watch on the reply stream, armed before the prompt is sent. */
 interface ReplyStream {
   /** Consume the reply; resolves when the site reports the turn finished. */
@@ -69,6 +81,15 @@ export interface AskRequest {
    * only what is new.
    */
   newChat: boolean
+  /**
+   * Run this turn in a throwaway tab instead of the conversation's own.
+   *
+   * Anything that is not the agent loop — a session title, a summary — needs one
+   * web conversation and never returns to it. Sharing the main tab would
+   * navigate the main conversation away, and the next agent turn would then have
+   * to navigate back and reload its whole history.
+   */
+  isolated?: boolean
   /** Absolute path of a file to attach; the caller owns its lifetime. */
   filePath?: string
   signal?: AbortSignal
@@ -173,6 +194,8 @@ export class WebSession {
   private readonly hardTimeoutMs: number
   private readonly deepThinking: boolean
   private readonly webSearch: boolean
+  /** The tab holding this session's conversation; null until one is bound. */
+  private mainTargetId: string | null = null
 
   constructor(options: WebSessionOptions) {
     this.endpoint = options.endpoint
@@ -206,8 +229,23 @@ export class WebSession {
     })
   }
 
-  /** Find the DeepSeek tab, or open one. */
-  private async resolveTarget(signal?: AbortSignal): Promise<CdpTarget> {
+  /**
+   * The tab this session's conversation lives in, or a fresh one for it.
+   *
+   * The id is remembered so the conversation keeps its own tab: picking "the
+   * first DeepSeek tab" every time is what let an isolated turn take the main
+   * conversation's page. A tab the user closed falls back to adopting an idle
+   * one, and then to opening one.
+   *
+   * Only a tab with no conversation open is adopted. A tab already showing a
+   * conversation is something the user is reading; navigating it away takes the
+   * page out from under them, so a new tab is opened instead — which also means
+   * the first turn needs no navigation at all.
+   *
+   * @param signal - abort the lookup.
+   * @returns the tab to use, and whether it already sits on a blank conversation.
+   */
+  private async resolveTarget(signal?: AbortSignal): Promise<ResolvedTab> {
     let targets: CdpTarget[]
     try {
       targets = await listTargets(this.endpoint, signal)
@@ -224,18 +262,38 @@ export class WebSession {
         )
       }
     }
-    const existing = targets.find(
-      target => target.type === 'page' && target.url.startsWith('https://chat.deepseek.com'),
+    const bound = this.mainTargetId === null
+      ? undefined
+      : targets.find(target => target.id === this.mainTargetId && target.type === 'page')
+    if (bound?.webSocketDebuggerUrl) return { target: bound, blank: isBlankConversation(bound.url) }
+    // 只收养停在空白输入页的标签页。一个已经打开某条对话的标签页是用户正在读的
+    // 东西,把它导航走等于当着用户的面抢走页面;宁可新开一个。
+    const idle = targets.find(
+      target => target.type === 'page'
+        && target.url.startsWith('https://chat.deepseek.com')
+        && isBlankConversation(target.url),
     )
-    if (existing?.webSocketDebuggerUrl) return existing
-    const created = await createTarget(this.endpoint, DEEPSEEK_URL, signal)
-    if (!created.webSocketDebuggerUrl) {
-      // /json/new 有时只回 id,再列一次把带 ws 地址的那条捞出来。
-      const refreshed = (await listTargets(this.endpoint, signal)).find(t => t.id === created.id)
-      if (refreshed?.webSocketDebuggerUrl) return refreshed
-      throw new BridgeError('新开的 DeepSeek 标签页没有可用的调试地址。', 'transport')
+    if (idle?.webSocketDebuggerUrl) {
+      this.mainTargetId = idle.id
+      return { target: idle, blank: true }
     }
-    return created
+    const created = await this.openTab(signal)
+    this.mainTargetId = created.id
+    return { target: created, blank: true }
+  }
+
+  /**
+   * Open one DeepSeek tab.
+   * @param signal - abort the request.
+   * @returns the new target, with a debugger address.
+   */
+  private async openTab(signal?: AbortSignal): Promise<CdpTarget> {
+    const created = await createTarget(this.endpoint, DEEPSEEK_URL, signal)
+    if (created.webSocketDebuggerUrl) return created
+    // /json/new 有时只回 id,再列一次把带 ws 地址的那条捞出来。
+    const refreshed = (await listTargets(this.endpoint, signal)).find(t => t.id === created.id)
+    if (refreshed?.webSocketDebuggerUrl) return refreshed
+    throw new BridgeError('新开的 DeepSeek 标签页没有可用的调试地址。', 'transport')
   }
 
   /** Install the page agent and wait until the composer exists. */
@@ -325,10 +383,23 @@ export class WebSession {
 
   /** One turn, with exclusive use of the tab already guaranteed. */
   private async *askExclusive(request: AskRequest): AsyncGenerator<BridgeEvent> {
-    const target = await this.resolveTarget(request.signal)
+    // 一次性标签页刚开出来就是空白新对话,不必再导航一次。
+    const { target, blank } = request.isolated
+      ? { target: await this.openTab(request.signal), blank: true }
+      : await this.resolveTarget(request.signal)
     const cdp = await CdpConnection.open(target.webSocketDebuggerUrl ?? '', request.signal)
     try {
       await cdp.send('Page.enable')
+
+      // 一个 agent 任务会让这个标签页在后台待上几十分钟。Chrome 会冻结甚至丢弃
+      // 后台标签页来回收内存,连接随之断开,整轮任务就以「CDP 连接已关闭」告终。
+      // 焦点模拟管不了这件事 —— 它翻的是 visibility,冻结/丢弃是另一套生命周期。
+      try {
+        await cdp.send('Page.setWebLifecycleState', { state: 'active' })
+      } catch {
+        // 这是一层保护而不是前提:旧版 Chrome 不认这个命令,少了它只是更容易
+        // 在长任务里被回收,不该让本来能跑的一轮直接失败。
+      }
 
       // 让页面自认为可见且获得焦点,但不动窗口、不抢用户的键盘焦点。
       // 需要它是因为:这个 profile 里可能不止一个标签(比如用户也在里面开了 dsh 界面),
@@ -338,15 +409,17 @@ export class WebSession {
       // 每轮问答都跳一次浏览器。焦点模拟两者都不占。
       await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true })
 
-      if (request.newChat) {
-        // 只有开新会话才导航;续问时导航会把网页那边的历史一起丢掉。
+      if (request.newChat && !blank) {
+        // 开新会话才需要导航,而且只在页面确实停在某条对话里时 —— 已经在空白
+        // 输入页上就什么都不用做,免掉一次用户看得见的跳转。
+        // 续问永不导航:那会把网页那边的历史一起丢掉。
         yield { kind: 'progress', text: '正在新开 DeepSeek 会话…' }
         // 监听必须先挂上:load 事件可能比 navigate 的响应先到。
         const loaded = cdp.once('Page.loadEventFired', NAVIGATION_TIMEOUT_MS)
         await cdp.send('Page.navigate', { url: DEEPSEEK_URL })
         await loaded
       } else {
-        yield { kind: 'progress', text: '在当前会话继续…' }
+        yield { kind: 'progress', text: request.newChat ? '使用空白会话…' : '在当前会话继续…' }
       }
 
       await this.waitReady(cdp, request.signal)
@@ -371,8 +444,21 @@ export class WebSession {
       } finally {
         reply.dispose()
       }
+    } catch (error: unknown) {
+      // 裸的「CDP 连接已关闭」说不出该怎么办。到这一层已经知道是哪个标签页,
+      // 也知道能断的原因只有这几种。
+      if (error instanceof CdpError && error.method === 'close') {
+        throw new BridgeError(
+          '与 DeepSeek 标签页的调试连接中断。标签页可能被关掉了，'
+            + '或者被浏览器冻结/丢弃以回收内存。请确认那个标签页还在。',
+          'transport',
+        )
+      }
+      throw error
     } finally {
       cdp.close()
+      // 一次性标签页用完即走;主对话的那个必须留着,它就是那条对话。
+      if (request.isolated) await closeTarget(this.endpoint, target.id, request.signal)
     }
   }
 

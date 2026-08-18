@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DsWebAdapter } from '../src/adapter.ts'
+import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import type { AskRequest, BridgeEvent, WebSession } from '../src/session.ts'
 
 /** Capture what the adapter would send, without touching a browser. */
@@ -18,12 +19,24 @@ function message(id: string, role: 'user' | 'assistant', text: string) {
   return { id, role, content: [{ type: 'text', text }], source: { kind: 'user' } }
 }
 
+/** An agent-loop request; the marker is what makes it own the web conversation. */
 function request(sessionId: string, messages: unknown[]) {
-  return {
+  return markAgentLoopRequest({
     provider: 'deepseek-web',
     model: 'deepseek-web',
     sessionId,
     system: '你是助手。',
+    messages,
+  } as never)
+}
+
+/** A request with no agent-loop marker — a session title, a summary. */
+function auxiliary(sessionId: string, messages: unknown[]) {
+  return {
+    provider: 'deepseek-web',
+    model: 'deepseek-web',
+    sessionId,
+    system: '给这段对话起个标题。',
     messages,
   } as never
 }
@@ -96,5 +109,39 @@ describe('web conversation reuse', () => {
     // 工具目录只在开场那一轮讲过,换了工具就必须重新开场。
     expect(sent[1]?.newChat).toBe(true)
     expect(sent[1]?.prompt).toContain('read')
+  })
+})
+
+describe('auxiliary requests', () => {
+  it('runs in a throwaway tab and leaves the conversation untouched', async () => {
+    const sent: AskRequest[] = []
+    const adapter = new DsWebAdapter({ session: fakeSession(sent), useAttachment: () => false })
+
+    await drain(adapter, request('s1', [message('m1', 'user', '第一个问题')]))
+    // 标题请求插在两轮之间:它要一次问答就走人,不该动主对话。
+    await drain(adapter, auxiliary('s1', [message('m1', 'user', '第一个问题')]))
+    await drain(adapter, request('s1', [
+      message('m1', 'user', '第一个问题'),
+      message('a1', 'assistant', '第一个回答'),
+      message('m2', 'user', '第二个问题'),
+    ]))
+
+    expect(sent[1]?.isolated).toBe(true)
+    expect(sent[1]?.newChat).toBe(true)
+    // 主对话的增量链没被打断:第三轮仍然只发新增,而不是全量重开。
+    expect(sent[2]?.isolated).toBeUndefined()
+    expect(sent[2]?.newChat).toBe(false)
+    expect(sent[2]?.prompt).toContain('第二个问题')
+    expect(sent[2]?.prompt).not.toContain('第一个问题')
+  })
+
+  it('never claims the conversation, so the next agent turn still opens one', async () => {
+    const sent: AskRequest[] = []
+    const adapter = new DsWebAdapter({ session: fakeSession(sent), useAttachment: () => false })
+
+    await drain(adapter, auxiliary('s1', [message('t1', 'user', '起标题')]))
+    await drain(adapter, request('s1', [message('m1', 'user', '第一个问题')]))
+
+    expect(sent[1]?.newChat).toBe(true)
   })
 })

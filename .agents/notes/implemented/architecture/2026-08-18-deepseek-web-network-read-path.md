@@ -64,6 +64,16 @@ The judgement is deliberately not the error kind. `transport` covers both a stre
 
 The opening-frame test also changed from position to shape. `p === undefined && lastPath === ''` identified the snapshot by being first; a site that ever led with a delta frame would have had that frame taken for a snapshot and its content dropped. `isSnapshot` checks for a `response` field instead.
 
+## Follow-up: the title request gets its own tab
+
+`resolveTarget` picked "the first DeepSeek tab" on every call, which is where the competition came from. dsh generates the session title through a second LLM request; that request navigated the shared tab to a new conversation, so the main conversation's record still pointed at a conversation the page had left, and the next agent turn could only start over with the full history.
+
+Requests now split on `isAgentLoopRequest`. An agent-loop turn binds the tab it found (`mainTargetId`) and keeps it; anything else — a title, a summary — runs in a tab opened for it and closed in `finally`, and touches none of the conversation bookkeeping.
+
+Physical isolation rather than time-sharing, because of which side pays. Navigating the shared tab means the auxiliary request loads a blank conversation (cheap) while the next agent turn reloads its entire history to get back (tens of seconds on a long one). Giving the auxiliary request its own tab moves the cost onto the side that is already cheap, and the main conversation pays nothing.
+
+Concurrent agent sessions are still not supported: two of them share one `conversation` field, so the second displaces the first and both degrade to opening a conversation per turn — slow, never crossed. The groundwork is now in place, though: conversations are URL-addressable (`/a/chat/s/<uuid>`) and navigating back into one resumes its history, verified live — a tab pool is the remaining piece.
+
 ## Testing
 
 `tests/sse.spec.ts` decodes streams captured from the site — one whose payload carries escaped quotes (the case the DOM path corrupted), one that switches from a `THINK` fragment to a `RESPONSE` fragment mid-stream — and asserts identical output when frames are cut at arbitrary chunk boundaries. `tests/stream.spec.ts` drives `DsWebAdapter` over bridge events: text emitted per delta, a call withheld from visible text, a partial marker never leaked, a prose candidate released at the end, and the turn total anchored to the reported value. Live runs over `dsh --profile` execute multi-step tool loops end to end.

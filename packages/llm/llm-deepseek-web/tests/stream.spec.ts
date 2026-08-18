@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { DsWebAdapter } from '../src/adapter.ts'
+import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { BridgeError, type AskRequest, type BridgeEvent, type WebSession } from '../src/session.ts'
 
@@ -30,17 +31,22 @@ function deltas(text: string[]): BridgeEvent[] {
 }
 
 function request(tools: string[] = ['glob', 'read']) {
-  return {
+  return markAgentLoopRequest({
     provider: 'deepseek-web',
     model: 'deepseek-web',
     sessionId: 's1',
     system: '你是助手。',
     messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: '看看' }], source: { kind: 'user' } }],
     tools: tools.map(name => ({ name, description: name, parameters: { type: 'object' } })),
-  } as never
+  } as never)
 }
 
-/** The same request with `count` user messages, so history grows turn over turn. */
+/**
+ * The same request with `count` user messages, so history grows turn over turn.
+ *
+ * The marker is a WeakSet on object identity, so a spread copy loses it — every
+ * turn has to be marked as itself.
+ */
 function turn(count: number) {
   const base = request() as unknown as { messages: unknown[] }
   const messages = Array.from({ length: count }, (_, i) => ({
@@ -49,7 +55,7 @@ function turn(count: number) {
     content: [{ type: 'text', text: `第 ${i + 1} 个问题` }],
     source: { kind: 'user' },
   }))
-  return { ...base, messages } as never
+  return markAgentLoopRequest({ ...base, messages } as never)
 }
 
 async function collect(adapter: DsWebAdapter, options: never): Promise<StreamChunk[]> {
@@ -129,8 +135,8 @@ describe('streaming from the site stream', () => {
     })
     const chunks = await collect(adapter, request())
     expect(textOf(chunks)).toBe('先看看。\n')
-    expect(blocks(chunks).filter(b => b.type === 'tool-call')).toEqual([
-      { type: 'tool-call', id: 'web-1-glob', name: 'glob', arguments: '{"pattern":"*.ts"}' },
+    expect(blocks(chunks).filter(b => b.type === 'tool-call')).toMatchObject([
+      { type: 'tool-call', name: 'glob', arguments: '{"pattern":"*.ts"}' },
     ])
     expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'tool-calls' } })
   })
@@ -177,5 +183,39 @@ describe('streaming from the site stream', () => {
     const adapter = new DsWebAdapter({ session: replaying(deltas(['12345678'])), useAttachment: () => false })
     const usage = (await collect(adapter, request())).find(c => c.type === 'usage')
     expect(usage).toMatchObject({ usage: { outputTokens: 2 } })
+  })
+})
+
+describe('tool-call identity', () => {
+  /** Every tool-call id the adapter emitted for one request. */
+  async function callIds(adapter: DsWebAdapter, options: never): Promise<string[]> {
+    return blocks(await collect(adapter, options)).flatMap(
+      block => block.type === 'tool-call' ? [block.id as string] : [],
+    )
+  }
+
+  it('never repeats an id across turns', async () => {
+    // 会话重放按 id 认 tool-call:两轮里同位置的同名调用撞成一个 id,
+    // 同一个 tool-call 就会收到两次 start,整段历史加载失败。
+    const reply = '<tool_call>{"name":"read","arguments":{"file_path":"a.ts"}}</tool_call>'
+    const adapter = new DsWebAdapter({ session: replaying(deltas([reply])), useAttachment: () => false })
+
+    const first = await callIds(adapter, turn(1))
+    const second = await callIds(adapter, turn(2))
+
+    expect(first).toHaveLength(1)
+    expect(second).toHaveLength(1)
+    expect(second[0]).not.toBe(first[0])
+  })
+
+  it('distinguishes two same-named calls in one reply', async () => {
+    const reply = [
+      '<tool_call>{"name":"read","arguments":{"file_path":"a.ts"}}</tool_call>',
+      '<tool_call>{"name":"read","arguments":{"file_path":"b.ts"}}</tool_call>',
+    ].join('\n')
+    const adapter = new DsWebAdapter({ session: replaying(deltas([reply])), useAttachment: () => false })
+
+    const ids = await callIds(adapter, turn(1))
+    expect(new Set(ids).size).toBe(2)
   })
 })

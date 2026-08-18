@@ -49,18 +49,65 @@ export async function listTargets(endpoint: string, signal?: AbortSignal): Promi
   return await getJson<CdpTarget[]>(`${normalizeEndpoint(endpoint)}/json/list`, signal)
 }
 
-/** Open a new tab and return its target. */
+/**
+ * Open a new tab without taking the foreground, and return its target.
+ *
+ * `/json/new` cannot do this: Chrome activates the tab it creates, which pulls
+ * the page out from under whoever is looking at the browser. Measured — a tab
+ * that was foreground reports `document.hidden === true` right after. Only
+ * `Target.createTarget` takes `background`, and only on a browser-level
+ * connection, so this opens one for the call.
+ *
+ * @param endpoint - the DevTools endpoint.
+ * @param url - the URL to open.
+ * @param signal - abort the request.
+ * @returns the new target, with a debugger address when Chrome reports one.
+ */
 export async function createTarget(
   endpoint: string,
   url: string,
   signal?: AbortSignal,
 ): Promise<CdpTarget> {
   const base = normalizeEndpoint(endpoint)
+  const version = await getJson<{ webSocketDebuggerUrl?: string }>(`${base}/json/version`, signal)
+  if (version.webSocketDebuggerUrl !== undefined) {
+    const browser = await CdpConnection.open(version.webSocketDebuggerUrl, signal)
+    try {
+      const created = await browser.send<{ targetId: string }>(
+        'Target.createTarget', { url, background: true },
+      )
+      // Target.createTarget 只回 id;ws 地址要从列表里取。
+      const listed = (await listTargets(endpoint, signal)).find(t => t.id === created.targetId)
+      if (listed) return listed
+      // 刚建的标签页还没进列表:回一个只带 id 的壳,调用方会再列一次取 ws 地址。
+      return { id: created.targetId, type: 'page', url, title: '' }
+    } finally {
+      browser.close()
+    }
+  }
+  // 拿不到 browser 连接时退回 HTTP:会抢前台,但比开不出标签页好。
   const target = `${base}/json/new?${encodeURIComponent(url)}`
   // 新版 Chrome 只接受 PUT;旧版只认 GET,所以失败再退回去试一次。
   const response = await fetch(target, { method: 'PUT', ...signal ? { signal } : {} })
   if (response.ok) return await response.json() as CdpTarget
   return await getJson<CdpTarget>(target, signal)
+}
+
+/**
+ * Close one tab.
+ * @param endpoint - the DevTools endpoint.
+ * @param id - the target id to close.
+ * @param signal - abort the request.
+ * @returns nothing; a target that is already gone is not an error.
+ */
+export async function closeTarget(endpoint: string, id: string, signal?: AbortSignal): Promise<void> {
+  const url = `${normalizeEndpoint(endpoint)}/json/close/${encodeURIComponent(id)}`
+  try {
+    await fetch(url, { ...signal ? { signal } : {} })
+  } catch (error: unknown) {
+    // 关不掉只会多留一个标签页,不该让整轮问答失败。调用方已经拿到回复了。
+    if (error instanceof Error && error.name === 'AbortError') throw error
+  }
 }
 
 interface Pending {

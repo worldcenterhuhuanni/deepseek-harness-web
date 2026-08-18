@@ -13,6 +13,7 @@ import {
   CallId,
   LlmAdapter,
   LlmError,
+  isAgentLoopRequest,
   type ContentBlock,
   type GenerateOptions,
   type LlmModelInfo,
@@ -21,6 +22,7 @@ import {
   type StreamChunk,
   type TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -149,8 +151,12 @@ export class DsWebAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    // 只有 agent loop 的请求拥有那条网页对话。标题、摘要这类请求要一次问答就
+    // 走人,让它们共用主标签页会把主对话导航掉,下一轮就得导航回去重载整段历史。
+    // 所以它们在一次性标签页里跑,也完全不参与这里的会话记账。
+    const isolated = !isAgentLoopRequest(options)
     // 续问只发新增:网页会话自己记着前面的轮次,重发全量既慢又会让历史重复叠加。
-    const blocker = this.resumeBlocker(options)
+    const blocker = isolated ? '这是一次性请求（非 agent loop）' : this.resumeBlocker(options)
     const resumeAt = blocker === null ? this.conversation?.sentIds.length ?? 0 : 0
     this.log?.(
       blocker === null
@@ -215,7 +221,11 @@ export class DsWebAdapter extends LlmAdapter {
       }
       yield* closeOpen()
       const index = nextIndex++
-      const id = CallId(`web-${index}-${parsed.name}`)
+      // id 必须在整个会话里唯一,不只是这一次请求里。块序号每次请求都从 0 重来,
+      // 所以拿它当 id 会让两轮里同位置的同名调用撞成一个 —— 会话重放时同一个
+      // tool-call 收到两次 start,历史直接加载失败。真实 API 的 id 由服务端保证
+      // 唯一,这条通路自己造 id,就得自己带够熵。
+      const id = CallId(`web-${randomUUID().slice(0, 12)}-${parsed.name}`)
       state.sawToolCall = true
       yield { type: 'block-start', index, blockType: 'tool-call' }
       yield { type: 'tool-call-delta', index, id, name: parsed.name, argumentsDelta: parsed.arguments }
@@ -241,6 +251,7 @@ export class DsWebAdapter extends LlmAdapter {
       const events = this.session.ask({
         prompt: asAttachment ? companionPrompt : document,
         newChat,
+        ...(isolated ? { isolated: true } : {}),
         ...(attachment ? { filePath: attachment.path } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
       })
@@ -293,14 +304,16 @@ export class DsWebAdapter extends LlmAdapter {
       // 只有整轮成功才认账:失败时网页那边到底收到多少无从确认,
       // 记成已发会让下一轮的增量建立在错误的基线上。
       const sessionId = String(options.sessionId ?? '')
-      this.conversation = sessionId
-        ? {
-          sessionId,
-          sentIds: options.messages.map(message => message.id),
-          toolNames: toolSignature(options),
-          system: options.system ?? '',
-        }
-        : null
+      if (!isolated) {
+        this.conversation = sessionId
+          ? {
+            sessionId,
+            sentIds: options.messages.map(message => message.id),
+            toolNames: toolSignature(options),
+            system: options.system ?? '',
+          }
+          : null
+      }
 
       yield { type: 'usage', usage: turnUsage(document, reply, totals) }
       yield { type: 'finish', reason: state.sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' } }
@@ -310,7 +323,7 @@ export class DsWebAdapter extends LlmAdapter {
       // 提交之前失败,页面就没见过这一轮,已打开的对话仍然可以续用 —— 登录过期或
       // 附件没挂上之后不必白白重开一个对话。提交之后就另说了:页面收到了多少、
       // 产出了什么都无从确认,继续用会让下一轮的增量建立在错误的基线上。
-      if (submitted) this.conversation = null
+      if (submitted && !isolated) this.conversation = null
       if (error instanceof BridgeError) {
         throw new LlmError(error.message, bridgeErrorCode(error.kind), { cause: error })
       }

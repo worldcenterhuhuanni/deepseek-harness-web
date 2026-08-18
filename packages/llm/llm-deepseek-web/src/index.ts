@@ -23,7 +23,7 @@ import { WebSession } from './session.ts'
 
 export { DsWebAdapter, DEFAULT_INLINE_LIMIT } from './adapter.ts'
 export { BridgeError, WebSession, DEEPSEEK_URL } from './session.ts'
-export { CdpConnection, CdpError, listTargets, createTarget, normalizeEndpoint } from './cdp.ts'
+export { CdpConnection, CdpError, listTargets, createTarget, closeTarget, normalizeEndpoint } from './cdp.ts'
 export { defaultUserDataDir, ensureChrome, findChrome, isEndpointUp } from './launch.ts'
 export { splitReply, parseToolCall, visibleEnd } from './parse.ts'
 export { CompletionStreamDecoder } from './sse.ts'
