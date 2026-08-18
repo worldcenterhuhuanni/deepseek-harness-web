@@ -1,4 +1,4 @@
-<#
+﻿<#
 双击 launchWindow.cmd 或直接运行本文件：把本仓库源码连同本插件一起跑起来（Windows）。
 macOS/Linux 用 launchMac.command。
 
