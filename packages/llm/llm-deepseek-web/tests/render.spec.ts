@@ -5,8 +5,12 @@
  * the reply itself", which sits right after the question and therefore outranks
  * the tool protocol at the top of the opening turn — so the model narrated its
  * intent ("let me look at that directory") and never emitted a call, and dsh saw
- * a plain stop. The fix removes the contradiction; it does NOT re-send the
- * protocol, which is still valid in the page's own history.
+ * a plain stop. Removing that contradiction was not enough: a run whose whole
+ * request rode as an attachment answered with `[调用 glob] {"pattern": …}`,
+ * naming a tool it could only have read from the attached catalog while
+ * inventing its own call syntax. The page reads an attachment as a document and
+ * only the composer text as an instruction, so the protocol now rides in the
+ * composer on every turn — opening and follow-up alike.
  *
  * @module @deepseek-ai/dsh-llm-deepseek-web/tests/render
  */
@@ -101,5 +105,34 @@ describe('renderIncrement', () => {
 
   it('returns null when nothing new needs sending', () => {
     expect(renderIncrement(options({ tools: TOOLS }), 3)).toBeNull()
+  })
+})
+
+describe('composer-borne tool protocol', () => {
+  it('states the protocol in the composer, not only in the attachment', () => {
+    // 附件里的格式约定会被当成可以转述的说明文字,而转述过的调用解析不了。
+    const opening = renderRequest(options({ tools: TOOLS }))
+    expect(opening.companionPrompt).toContain(TOOL_CALL_OPEN)
+    expect(opening.companionPrompt).toContain('```json')
+
+    const followup = renderIncrement(options({ tools: TOOLS }), 2)
+    expect(followup?.companionPrompt).toContain(TOOL_CALL_OPEN)
+    expect(followup?.companionPrompt).toContain('```json')
+  })
+
+  it('replays historical calls in the fenced form the protocol asks for', () => {
+    // 模型会模仿历史里见过的写法;历史用裸 JSON 就等于示范了一种会被渲染破坏的格式。
+    const { document } = renderRequest(options({
+      tools: TOOLS,
+      messages: [
+        { id: 'm1', role: 'user', content: [{ type: 'text', text: '看看' }] },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'read_file', arguments: '{"path":"a.ts"}' }],
+        },
+      ],
+    }))
+    expect(document).toContain('```json\n{"id":"c1","name":"read_file"')
   })
 })

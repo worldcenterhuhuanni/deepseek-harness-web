@@ -1,0 +1,69 @@
+# Agent Note：网页路由改读站点自己的响应流，DOM 只保留写入
+
+Status: implemented
+
+[English](2026-08-18-deepseek-web-network-read-path.md) | 中文
+
+## 问题
+
+一天之内三个 bug 让 `deepseek-web` 的回合停在半路，每个都是同一个成因的不同表现。桥接层从渲染后的 DOM 读回复，而渲染不是传输。
+
+- `innerText` 的快照被当成增量。页面会回头改写已渲染的文本，改写破坏了前缀关系，兜底分支于是重发整份快照；四次改写拼出四份回复，`<tool_call>` 的配对被彻底撕碎。
+- markdown 把 `\"` 折成 `"`，于是任何带引号参数的调用都变成无法解析的 JSON。
+- 渲染后的代码块丢掉反引号，却留下语言标签和它自己的「复制/下载」按钮文字，所以一个本来合规的调用到手时长这样：`<tool_call>\n\njson\n复制\n下载\n{…}`。
+
+每次修复都是对的，但没有一次触及成因。`agent-loop` 全程行为正确：一条没有 `tool-call` block 的回复就是最终答案，回合因此正常结束。
+
+DOM 路径当初的理由是「更抗改版」。这不成立：`page-agent.ts` 靠 `.ds-markdown` 定位回复，那是个随站点前端发版变化的混淆 class，而且它还要在此之上额外承受渲染税。
+
+## 决定
+
+从站点自己的 `POST /api/v0/chat/completion` 响应读回复；写入仍走 DOM。
+
+响应是 `text/event-stream`，携带针对一个 response 对象的 JSON-Patch 式帧（`{p, o, v}`，`p`/`o` 省略时继承上一帧）。`CompletionStreamDecoder` 只投影四条值得投影的路径：`response/fragments` 的追加登记一个 fragment 及其种类，`response/fragments/-1/content` 的追加按该种类分流到正文或思考（`THINK` 是思考），`response/status` 置为 `FINISHED` 结束回合，`accumulated_token_usage` 给出会话累计值。
+
+换来的不是优雅，而是：增量纯追加、永不回改，转义逐字存活，不混入任何 UI 装饰。上面三个 bug 在这条路径上不可能发生。
+
+写入刻意留在 DOM。请求是页面自己的：它带着站点的 PoW 挑战（`create_pow_challenge`，`DeepSeekHashV1`，难度 144000）、cookie 和签名头。被动读回来的字节完全不碰这些，所以浏览器指纹仍是真实用户的，也从不构造任何请求。
+
+这条路径依赖三个机制：
+
+- **监听在提示词发出之前挂上。** 触发回复请求的正是 `compose`，所以 `openReplyStream` 先跑，`askExclusive` 之后再消费。把 `Network` 的启用放在 `compose` 之后会完全错过那个请求——第一次实跑就是这么失败的。
+- **`streamResourceContent` 返回前的 `dataReceived` 只报长度。** 那些字节由该调用的 `bufferedData` 一次补齐，所以建流前的事件直接丢弃，不能重复计入。
+- **回合总量是准的，拆分不是。** `accumulated_token_usage` 是一个数，覆盖提示词与回复，而 dsh 的 `TokenUsage` 把两者分开。总和取站点报的真值——compaction 触发在总和上——拆分则按两侧各自的 4 字符/token 估算比例分配。
+
+流式随之回来。可见正文边到达边发出，上限是 `visibleEnd`：第一个可能开启工具调用的位置，包含尾部正在长成的半截标记。一个调用绝不能同时又作为文本抵达用户，而发出去的文本收不回来；扣住的尾巴在收尾时交给 `splitReply`，那里也正是「原来只是普通正文」的候选被放行的地方。
+
+`splitReply` 的宽容保留。格式漂移是站点的系统提示词压过我们，与渲染无关——四种被识别的写法依然都需要。
+
+## 影响
+
+`page-agent.ts` 去掉了回复提取、`MutationObserver` 推送通道、「文本静默即完成」的启发式判定，以及所有混淆 class 选择器（`.ds-markdown`、`.ds-virtual-list-visible-items`）。`PageSnapshot` 只剩 `loggedIn`、`hasInput`、`failed`、`busy`——全部读自语义化属性或页面文本。`session.ts` 去掉了轮询循环。净改动删掉的代码多于新增。
+
+`BridgeEvent` 变成 union：回复内容重新是增量的，token 累计值随同一条流传出，而不是回头从 session 上读，于是适配器只消费桥接层，不再反向调用它。
+
+`classify` 现在也服务于 `attach`——那里此前对页面报告的附件失败硬编码了 `unknown`，而那完全可能是登录或限流问题。完成请求的 HTTP 状态码经 `classifyStatus` 映射。
+
+这条路由仍然不能保证的：SSE 的字段名与路径是站点的私有约定，`Network.streamResourceContent` 是实验性 CDP 命令。两者任一变化都会明确失败——未知路径不被投影，建流失败抛 `TRANSPORT`——而不是悄悄产出错误文本。
+
+## 考虑过的其他方案
+
+- **保留 DOM 读取，继续加固解析器。** 这正是当天三次修复做的事。每次都必要，没有一次充分，而第四个症状在第三个时就已经注定：页面在模型的字节与 `innerText` 之间做的任何事，都要由我们来撤销。
+- **自己构造请求，不靠页面发。** 那能彻底摆脱 DOM，但意味着每轮都要算 `DeepSeekHashV1` 并复现站点的签名头——一个被构造出来的请求，而这条路由的全部前提正是「浏览器自己的会话才是真的」。
+- **不设上限地流式，事后去重。** 没有事后：`text-delta` 一旦发出就收不回来，已经作为文本展示过的调用只能继续展示着。
+
+## 后续:一次失败的代价,和一次沉默藏起的东西
+
+复查这次改动时浮出两个缺口,都在此一并修掉。
+
+**每次失败都重置那条已打开的对话,粒度太粗。** 重置的理由是:失败的回合让「页面收到了多少」变得无从确认,续用会让下一轮的增量建立在错误的基线上。但这个理由只在提示词已经提交之后成立。提交之前——`waitReady` 时登录过期、附件站点解析不了、输入框找不到——页面根本没见过这一轮,重开对话是白白丢掉一条有效的。`BridgeEvent` 因此增加 `submitted` 里程碑,重置以它为条件。
+
+判据刻意不采用错误类型。`transport` 同时覆盖「提交后流断了」(必须重置)和「输入框从没找到」(不必重置),而 `waitReady` 抛出的 `not-logged-in` 反倒是最该保留的一种。错误类型与「页面收到了什么」之间没有因果关系。
+
+**解码器读不懂的帧不留任何痕迹。** 跳过它是对的——一行读不懂的帧不该让已经收到的回复作废——但沉默恰恰就是协议变更会产生的现象。解码器现在把它报成 `undecodable` 事件,由 session 转成 `diagnostic`,再由适配器路由到 `ctx.logger`;解码器本身仍是纯投影,不持有 logger。工具调用解析失败走同一条路,因为那个失败率是这条路由唯一的健康指标,而一次失败会让回合就此被判成完成。
+
+开场帧的判据也从位置改成了形状。`p === undefined && lastPath === ''` 是靠「它排在最前」来认定开场帧的;站点一旦改成先发一个 delta 帧,那一帧就会被当成开场帧、内容被丢掉。现在由 `isSnapshot` 检查是否带 `response` 字段。
+
+## 测试
+
+`tests/sse.spec.ts` 解码从站点抓来的真实流——一份载荷带转义引号（DOM 路径损坏过的那个 case），一份在流中途从 `THINK` fragment 切到 `RESPONSE` fragment——并断言帧被切在任意块边界时输出一致。`tests/stream.spec.ts` 用桥接事件驱动 `DsWebAdapter`：正文按 delta 逐块发出、调用不进可见文本、半截标记从不泄漏、普通正文候选在收尾时放行、回合总量锚定站点报的值。`dsh --profile` 的实跑完整执行了多步工具循环。

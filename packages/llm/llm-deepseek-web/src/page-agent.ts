@@ -15,12 +15,6 @@
 export interface PageSnapshot {
   loggedIn: boolean
   hasInput: boolean
-  /** Body text of the newest assistant reply; empty until one exists. */
-  text: string
-  /** Non-empty message bubbles *currently rendered* — a virtual list, so not a total. */
-  count: number
-  /** Best-effort "still producing" signal; reply completion does not rely on it. */
-  generating: boolean
   /** Page text matched an upload/parse failure hint. */
   failed: string
   /** An attachment is still uploading or parsing. */
@@ -48,12 +42,8 @@ export const PAGE_AGENT = String.raw`
     'div[role="button"][aria-label*="发送"]',
     'div[role="button"][aria-label*="Send"]',
   ];
-  // 消息条目本身的 class 是混淆值(_9663006 之类),会随发版变化,只能靠位置取。
-  // 容器 class 是语义化的,相对稳定。旧版结构留作兜底。
-  const MESSAGE_CONTAINER = '.ds-virtual-list-visible-items';
-  // 助手回复的正文节点,实际 class 是 'ds-markdown ds-assistant-message-main-content'。
-  const REPLY_BODY = '.ds-markdown';
-  const ASSISTANT_SELECTORS = ['.ds-markdown', '.markdown-body', '[class*="markdown"]'];
+  // 回复内容不从 DOM 读:那需要盯站点的混淆 class,而且拿到的是渲染结果。
+  // 这里只留输入、发送、登录/忙碌状态所需的选择器 —— 都是语义化属性。
   const LOGIN_HINT = /登录|sign in|log in|驗證|验证码/i;
   const FAIL_HINT = /解析失败|未能发送|发送失败|upload failed|parse failed/i;
   const BUSY_HINT = /解析中|上传中|处理中|Uploading|Parsing|Loading/i;
@@ -96,46 +86,6 @@ export const PAGE_AGENT = String.raw`
       return /发送|Send|提交/i.test(t) && !b.disabled;
     });
     return byLabel || null;
-  }
-
-  /**
-   * 最新一条助手回复的正文。
-   *
-   * 只能读正文节点,不能读整条气泡的 innerText:气泡里还有站点自己的状态文字
-   * (读附件时的「正在阅读」)和底部那排操作按钮,整条读会把它们当成模型输出,
-   * 上游看到的就是以「正在阅读」开头的回答。
-   * 没有正文节点就返回空 —— 那正是「站点还在忙、回答尚未开始」的状态。
-   */
-  function replyText() {
-    const nodes = document.querySelectorAll(REPLY_BODY);
-    if (!nodes.length) return '';
-    return ((nodes[nodes.length - 1].innerText) || '').trim();
-  }
-
-  function messageTexts() {
-    const container = document.querySelector(MESSAGE_CONTAINER);
-    if (container) {
-      return Array.from(container.children)
-        .map((el) => (el.innerText || '').trim())
-        .filter(Boolean);
-    }
-    const out = [];
-    for (const sel of ASSISTANT_SELECTORS) {
-      document.querySelectorAll(sel).forEach((n) => {
-        const t = (n.innerText || '').trim();
-        if (t) out.push(t);
-      });
-      if (out.length) break;
-    }
-    return out;
-  }
-
-  // 站点已经不用 <button> 了(全是 [role=button]),所以这里放宽匹配。
-  // 仅作报活提示用,回复是否结束由文本稳定性判断,不依赖它。
-  function isGenerating() {
-    const nodes = Array.from(document.querySelectorAll('[role="button"], button'));
-    return nodes.some((b) => /停止|Stop generating|停止生成|Stop/i.test(
-      b.getAttribute('aria-label') || b.textContent || ''));
   }
 
   function isLoggedIn() {
@@ -183,34 +133,6 @@ export const PAGE_AGENT = String.raw`
   }
 
   window.__dshWeb = {
-    /**
-     * 开始把页面变化推给驱动方,取代外部轮询。
-     *
-     * MutationObserver 看到变化就调 __dshEmit(由 CDP 的 Runtime.addBinding 注入),
-     * 驱动方收到 Runtime.bindingCalled 事件。流式输出每秒会产生大量 mutation,
-     * 所以在页面内合并成最多每 EMIT_THROTTLE_MS 一次,避免把连接淹掉。
-     */
-    startWatch(throttleMs) {
-      if (window.__dshWatch) return true;
-      if (typeof window.__dshEmit !== 'function') return false;
-      let timer = null;
-      const flush = () => {
-        timer = null;
-        try { window.__dshEmit(JSON.stringify(window.__dshWeb.snapshot())); } catch (e) { /* 连接已断 */ }
-      };
-      const schedule = () => { if (timer === null) timer = setTimeout(flush, throttleMs); };
-      const observer = new MutationObserver(schedule);
-      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      window.__dshWatch = observer;
-      schedule();
-      return true;
-    },
-
-    stopWatch() {
-      if (window.__dshWatch) { window.__dshWatch.disconnect(); window.__dshWatch = null; }
-      return true;
-    },
-
     /** 等输入框出现(页面加载完成的实际判据)。 */
     waitInput(timeoutMs) {
       return waitUntil(() => findInput(), timeoutMs);
@@ -243,15 +165,11 @@ export const PAGE_AGENT = String.raw`
     },
 
     snapshot() {
-      const texts = messageTexts();
       const body = (document.body && document.body.innerText) || '';
       const failMatch = body.match(FAIL_HINT);
       return {
         loggedIn: isLoggedIn(),
         hasInput: Boolean(findInput()),
-        text: replyText(),
-        count: texts.length,
-        generating: isGenerating(),
         failed: failMatch ? failMatch[0] : '',
         busy: BUSY_HINT.test(body),
       };

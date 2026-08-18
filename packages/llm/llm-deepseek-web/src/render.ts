@@ -29,6 +29,33 @@ const TASK_INSTRUCTION = [
   `需要用工具才能回答时，直接按约定的 ${TOOL_CALL_OPEN} 格式输出调用，不要只说明你打算做什么。`,
 ].join('\n')
 
+/**
+ * The tool-call protocol, verbatim — the one text every surface repeats.
+ *
+ * It rides in the composer, not only in the attachment. An attachment is read
+ * as a document: the model takes the tool *catalog* from it (it names tools it
+ * could only have read there) while treating the *format* rule as prose it may
+ * paraphrase, and a paraphrased call is an unparseable one. The composer text
+ * is the only part of a request the page treats as an instruction.
+ *
+ * The JSON sits in a fenced block because the page renders markdown before we
+ * read it back: outside a fence, `\"` renders as `"` and every call carrying a
+ * quoted argument arrives as broken JSON.
+ */
+const TOOL_CALL_PROTOCOL = [
+  '需要调用工具时，严格按下面这段输出，不要改写格式，也不要只描述你打算做什么：',
+  '',
+  TOOL_CALL_OPEN,
+  '```json',
+  '{"name": "工具名", "arguments": {…}}',
+  '```',
+  TOOL_CALL_CLOSE,
+  '',
+  '- `arguments` 必须是符合该工具 JSON Schema 的 JSON 对象',
+  '- JSON 必须放在 ```json 代码块里，否则参数里的引号会在渲染时损坏',
+  '- 一次可以连续输出多段工具调用',
+].join('\n')
+
 /** Render the blocks of one message; unknown block types degrade to a labeled placeholder. */
 function renderBlocks(blocks: readonly ContentBlock[]): string {
   const parts: string[] = []
@@ -43,7 +70,13 @@ function renderBlocks(blocks: readonly ContentBlock[]): string {
         break
       case 'tool-call':
         parts.push(
-          `${TOOL_CALL_OPEN}\n${JSON.stringify({ id: block.id, name: block.name, arguments: safeParse(block.arguments) })}\n${TOOL_CALL_CLOSE}`,
+          [
+            TOOL_CALL_OPEN,
+            '```json',
+            JSON.stringify({ id: block.id, name: block.name, arguments: safeParse(block.arguments) }),
+            '```',
+            TOOL_CALL_CLOSE,
+          ].join('\n'),
         )
         break
       case 'tool-result': {
@@ -90,14 +123,7 @@ function renderTools(tools: readonly ToolSchema[]): string {
     '',
     '## 工具调用格式（严格遵守）',
     '',
-    '需要调用工具时，输出且只输出下面这段，不要附加解释、不要放进代码块：',
-    '',
-    TOOL_CALL_OPEN,
-    '{"name": "工具名", "arguments": {…}}',
-    TOOL_CALL_CLOSE,
-    '',
-    '- `arguments` 必须是符合该工具 JSON Schema 的 JSON 对象',
-    '- 一次可以连续输出多段工具调用',
+    TOOL_CALL_PROTOCOL,
   ].join('\n')
 }
 
@@ -163,7 +189,7 @@ export function renderIncrement(
 
   return {
     document: sections.join('\n\n---\n\n'),
-    companionPrompt: '请阅读附件中的新增内容，继续以助手身份作答。',
+    companionPrompt: `请阅读附件中的新增内容，继续以助手身份作答。\n\n${TOOL_CALL_PROTOCOL}`,
   }
 }
 
@@ -180,6 +206,6 @@ export function renderRequest(options: GenerateOptions): RenderedRequest {
 
   return {
     document: sections.join('\n\n---\n\n'),
-    companionPrompt: '请阅读附件中的对话记录，按其中「你的任务」一节作答。',
+    companionPrompt: `请阅读附件中的对话记录，按其中「你的任务」一节作答。\n\n${TOOL_CALL_PROTOCOL}`,
   }
 }

@@ -25,8 +25,13 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BridgeError, type WebSession } from './session.ts'
-import { ToolCallSplitter, parseToolCall, type SplitEvent } from './parse.ts'
+import { parseToolCall, splitReply, visibleEnd, type SplitEvent } from './parse.ts'
 import { renderIncrement, renderRequest } from './render.ts'
+
+/** The tool names this request offers; gates recovery of unmarked calls. */
+function knownTools(options: GenerateOptions): ReadonlySet<string> {
+  return new Set((options.tools ?? []).map(tool => tool.name))
+}
 
 /** Tool set identity; a changed set means the opening turn no longer describes the truth. */
 function toolSignature(options: GenerateOptions): string {
@@ -157,10 +162,17 @@ export class DsWebAdapter extends LlmAdapter {
     const { document, companionPrompt } = rendered ?? renderRequest(options)
     const asAttachment = this.useAttachment() && document.length > this.inlineLimit()
 
-    const splitter = new ToolCallSplitter()
     let nextIndex = 0
     let open: OpenBlock | null = null
-    let outputChars = 0
+    // 回复正文按到达顺序累积;shown 是已作为可见文本发出的长度。
+    let reply = ''
+    let shown = 0
+    // 站点报的是会话累计值:首次观测是本轮的基线,末次是本轮结束后的总量。
+    let totals: { baseline: number; final: number } | null = null
+    // 提示词是否已经进入网页对话;决定失败后那条对话还能不能复用。
+    let submitted = false
+    // 内层 generator 拿不到 this,先取出来。
+    const { log } = this
     // 放进对象里:它只在内层 generator 中被置真,写成局部 let 会被控制流分析判成恒假。
     const state = { sawToolCall: false }
 
@@ -195,7 +207,9 @@ export class DsWebAdapter extends LlmAdapter {
     const emitToolCall = function* (raw: string): Generator<StreamChunk> {
       const parsed = parseToolCall(raw)
       if (!parsed) {
-        // 模型把格式跑飞了。不静默丢弃:退回成可见文本,让上层看得见发生了什么。
+        // 模型把格式跑飞了。退回成可见文本让人看得见,同时记一笔:这条路由的
+        // 格式全靠模型配合,解析失败率是它唯一的健康指标,而回合会就此判成完成。
+        log?.(`工具调用解析失败，已退回文本：${raw.slice(0, 200)}`)
         yield* emit('text', raw)
         return
       }
@@ -240,11 +254,36 @@ export class DsWebAdapter extends LlmAdapter {
           continue
         }
 
-        outputChars += event.text.length
-        yield* emitPieces(splitter.push(event.text))
+        if (event.kind === 'submitted') {
+          submitted = true
+          continue
+        }
+
+        if (event.kind === 'diagnostic') {
+          this.log?.(event.text)
+          continue
+        }
+
+        if (event.kind === 'usage') {
+          totals = totals === null
+            ? { baseline: event.totalTokens, final: event.totalTokens }
+            : { baseline: totals.baseline, final: event.totalTokens }
+          continue
+        }
+
+        // 站点的流是纯追加的,所以正文可以边收边发。发到 visibleEnd 为止:
+        // 之后的字节可能是一个调用的开头,而发出去的文本收不回来。
+        reply += event.text
+        const safe = visibleEnd(reply)
+        if (safe > shown) {
+          yield* emit('text', reply.slice(shown, safe))
+          shown = safe
+        }
       }
 
-      yield* emitPieces(splitter.flush())
+      // 收尾时才解析:一个调用的 JSON 只有完整时才可用,而扣住的尾巴里也可能
+      // 只是普通正文,那部分在这里放行。
+      yield* emitPieces(splitReply(reply.slice(shown), knownTools(options)))
       yield* closeOpen()
 
       if (nextIndex === 0) {
@@ -263,12 +302,15 @@ export class DsWebAdapter extends LlmAdapter {
         }
         : null
 
-      yield { type: 'usage', usage: estimateUsage(document, outputChars) }
+      yield { type: 'usage', usage: turnUsage(document, reply, totals) }
       yield { type: 'finish', reason: state.sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' } }
     } catch (error) {
       // 未闭合的块必须先收口,否则 finish 会违反流语法校验。
       yield* closeOpen()
-      this.conversation = null
+      // 提交之前失败,页面就没见过这一轮,已打开的对话仍然可以续用 —— 登录过期或
+      // 附件没挂上之后不必白白重开一个对话。提交之后就另说了:页面收到了多少、
+      // 产出了什么都无从确认,继续用会让下一轮的增量建立在错误的基线上。
+      if (submitted) this.conversation = null
       if (error instanceof BridgeError) {
         throw new LlmError(error.message, bridgeErrorCode(error.kind), { cause: error })
       }
@@ -293,15 +335,35 @@ async function writeContextFile(document: string): Promise<{ path: string; clean
 }
 
 /**
- * The web session reports no token counts, but dsh's compaction triggers on
- * them — reporting nothing would mean compaction never fires on long sessions.
+ * Token usage for one turn, anchored to what the site itself reported.
  *
- * ponytail: 4 chars/token is a crude CJK-hostile estimate; swap in a real
- * tokenizer if compaction starts firing at visibly wrong points.
+ * The completion stream states the conversation's running total before and
+ * after the turn, so their difference is the turn's real cost — but it is one
+ * number covering prompt and completion together, which dsh's `TokenUsage`
+ * splits. So the total is exact and the split is proportional to a 4-chars-per-
+ * token estimate of each side: dsh's compaction triggers on the sum, which is
+ * the half that has to be right.
+ *
+ * Without a reported total, both sides fall back to that estimate — crude, and
+ * hostile to CJK, but better than reporting nothing and never compacting.
+ *
+ * @param prompt - the rendered request.
+ * @param reply - the reply text.
+ * @param reported - the running totals bracketing this turn, when available.
+ * @returns usage in dsh's shape.
  */
-function estimateUsage(prompt: string, outputChars: number): TokenUsage {
-  return {
-    inputTokens: Math.ceil(prompt.length / 4),
-    outputTokens: Math.ceil(outputChars / 4),
-  }
+function turnUsage(
+  prompt: string,
+  reply: string,
+  reported: { baseline: number; final: number } | null,
+): TokenUsage {
+  const estimatedInput = Math.ceil(prompt.length / 4)
+  const estimatedOutput = Math.ceil(reply.length / 4)
+  if (reported === null) return { inputTokens: estimatedInput, outputTokens: estimatedOutput }
+  const total = Math.max(0, reported.final - reported.baseline)
+  const estimatedTotal = estimatedInput + estimatedOutput
+  const outputTokens = estimatedTotal === 0
+    ? 0
+    : Math.min(total, Math.round((total * estimatedOutput) / estimatedTotal))
+  return { inputTokens: total - outputTokens, outputTokens }
 }

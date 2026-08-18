@@ -8,16 +8,47 @@
  * @module @deepseek-ai/dsh-llm-deepseek-web/session
  */
 
-import { CdpConnection, CdpError, createTarget, listTargets, type CdpTarget } from './cdp.ts'
+import { CdpConnection, createTarget, listTargets, type CdpTarget } from './cdp.ts'
 import { defaultUserDataDir, ensureChrome } from './launch.ts'
 import { PAGE_AGENT, type PageSnapshot } from './page-agent.ts'
+import { CompletionStreamDecoder, type StreamEvent } from './sse.ts'
 
 export const DEEPSEEK_URL = 'https://chat.deepseek.com/'
 
-/** One piece of a reply, already classified. */
-export interface BridgeEvent {
-  kind: 'text' | 'thinking' | 'progress'
-  text: string
+/**
+ * One piece of a reply, already classified.
+ *
+ * Every kind is incremental. Reply content comes from the site's own
+ * `text/event-stream`, whose deltas are append-only and never revised, so the
+ * concatenation of `text` events is exactly what the model produced — including
+ * escapes the DOM's rendered `innerText` would have collapsed.
+ */
+export type BridgeEvent =
+  | { kind: 'text' | 'thinking' | 'progress'; text: string }
+  /** The conversation's running token total, whenever the stream states it. */
+  | { kind: 'usage'; totalTokens: number }
+  /**
+   * The prompt has entered the web conversation.
+   *
+   * Everything before this is recoverable: the page never saw this turn, so an
+   * open conversation stays valid. After it, what the page received is no longer
+   * knowable from here.
+   */
+  | { kind: 'submitted' }
+  /**
+   * Something the bridge could not interpret, for the log.
+   *
+   * Reported rather than held because the session has no logger of its own; the
+   * adapter owns that route.
+   */
+  | { kind: 'diagnostic'; text: string }
+
+/** A watch on the reply stream, armed before the prompt is sent. */
+interface ReplyStream {
+  /** Consume the reply; resolves when the site reports the turn finished. */
+  events: (signal?: AbortSignal) => AsyncGenerator<BridgeEvent>
+  /** Release the CDP listeners. */
+  dispose: () => void
 }
 
 /** Why a bridged request failed; the adapter maps this onto a dsh error code. */
@@ -71,12 +102,10 @@ const NAVIGATION_TIMEOUT_MS = 30_000
 const SENDABLE_TIMEOUT_MS = 5_000
 /** 上限而非固定等待:等不到就说明回车没生效,退回去点发送控件。 */
 const SUBMIT_TIMEOUT_MS = 3_000
-/** 页面用它把变化推回来,取代外部轮询。 */
-const PUSH_BINDING = '__dshEmit'
-/** 页面内合并 mutation 的窗口:流式输出的 mutation 非常密集。 */
-const PUSH_THROTTLE_MS = 120
-/** 文本连续这么多轮不变才算说完,约 1.6 秒,够跨过流式输出中的停顿。 */
-const STABLE_TICKS_TO_FINISH = 4
+/** The site's own completion endpoint; its response body is the reply stream. */
+const COMPLETION_URL = 'https://chat.deepseek.com/api/v0/chat/completion'
+/** 发送后等这么久还没看到回复请求,就当页面改版了。 */
+const REQUEST_WAIT_MS = 30_000
 
 /**
  * A one-holder gate over a single resource.
@@ -115,6 +144,17 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new BridgeError('请求已取消。', 'transport')
+}
+
+/**
+ * Classify the completion request's HTTP status so dsh can route on it.
+ * @param status - the response status code, known to be an error.
+ * @returns the matching bridge failure kind.
+ */
+function classifyStatus(status: number): BridgeErrorKind {
+  if (status === 429) return 'rate-limited'
+  if (status === 401 || status === 403) return 'not-logged-in'
+  return 'unknown'
 }
 
 /** Classify a page-reported failure so dsh can route on it. */
@@ -249,7 +289,7 @@ export class WebSession {
       throwIfAborted(signal)
       const snapshot = await cdp.evaluate<PageSnapshot>('window.__dshWeb.snapshot()')
       if (snapshot.failed) {
-        throw new BridgeError(`DeepSeek 提示「${snapshot.failed}」，附件未能挂上。`, 'unknown')
+        throw new BridgeError(`DeepSeek 提示「${snapshot.failed}」，附件未能挂上。`, classify(snapshot.failed))
       }
       if (!snapshot.busy) {
         yield { kind: 'progress', text: '附件已就绪。' }
@@ -309,9 +349,7 @@ export class WebSession {
         yield { kind: 'progress', text: '在当前会话继续…' }
       }
 
-      const ready = await this.waitReady(cdp, request.signal)
-      // 发送前的回复正文:本轮回复算不算「新」全靠跟它比。
-      const baselineText = ready.text
+      await this.waitReady(cdp, request.signal)
 
       // 新对话会把开关恢复成站点默认(智能搜索是开的),所以每次开场都对齐一遍。
       if (request.newChat) {
@@ -320,12 +358,19 @@ export class WebSession {
         )
       }
 
-      if (request.filePath !== undefined) yield* this.attach(cdp, request.filePath, request.signal)
+      // 监听必须先挂:回复请求在 compose 里就发出去了,之后再挂已经错过它。
+      const reply = await this.openReplyStream(cdp)
+      try {
+        if (request.filePath !== undefined) yield* this.attach(cdp, request.filePath, request.signal)
 
-      yield* this.compose(cdp, request.prompt, request.signal)
-      yield { kind: 'progress', text: '已发送，等待回复…' }
+        yield* this.compose(cdp, request.prompt, request.signal)
+        yield { kind: 'submitted' }
+        yield { kind: 'progress', text: '已发送，等待回复…' }
 
-      yield* this.readReply(cdp, baselineText, request.signal)
+        yield* reply.events(request.signal)
+      } finally {
+        reply.dispose()
+      }
     } finally {
       cdp.close()
     }
@@ -392,139 +437,167 @@ export class WebSession {
   }
 
   /**
-   * Stream the reply as the page reports it.
+   * Stream the reply from the site's own completion response.
    *
-   * The page pushes snapshots through a CDP binding whenever its DOM changes,
-   * so new text surfaces as soon as it renders instead of on the next poll
-   * tick. A slow poll stays as a safety net: the observer can miss a mutation,
-   * and completion is decided by text going quiet, which needs a tick even when
-   * nothing changes.
+   * The request is the page's, not ours: it carries the site's PoW challenge,
+   * cookies, and headers, and we only read the bytes coming back. That keeps
+   * the browser fingerprint untouched while giving us the model's exact output
+   * instead of its rendered form.
+   *
+   * `Network.streamResourceContent` is what makes it live. Until it returns,
+   * `Network.dataReceived` events carry only lengths, and the bytes they
+   * describe come back once in that call's `bufferedData` — so events before it
+   * are dropped rather than double-counted.
    */
-  private async *readReply(
-    cdp: CdpConnection,
-    baselineText: string,
-    signal?: AbortSignal,
-  ): AsyncGenerator<BridgeEvent> {
-    const started = Date.now()
-    let pushed: PageSnapshot | undefined
+  private async openReplyStream(cdp: CdpConnection): Promise<ReplyStream> {
+    const decoder = new CompletionStreamDecoder()
+    const pending: StreamEvent[] = []
+    // 这些状态由 CDP 回调写、由下面的循环读。放进对象里而不是写成局部 let:
+    // 控制流分析看不到回调的赋值,会把循环里读到的值窄化成初始值。
+    const stream: {
+      requestId: string | null
+      streaming: boolean
+      finished: boolean
+      failure: { message: string; kind: BridgeErrorKind } | null
+    } = { requestId: null, streaming: false, finished: false, failure: null }
+    let lastActivity = Date.now()
+    const started = lastActivity
     let wake: (() => void) | null = null
-    const offBinding = cdp.on('Runtime.bindingCalled', (params) => {
-      const event = params as { name?: string; payload?: string }
-      if (event.name !== PUSH_BINDING || typeof event.payload !== 'string') return
-      try {
-        pushed = JSON.parse(event.payload) as PageSnapshot
-      } catch {
-        return
-      }
+    const nudge = () => {
+      lastActivity = Date.now()
       wake?.()
       wake = null
+    }
+    const feed = (bytes: string): void => {
+      pending.push(...decoder.push(bytes))
+      nudge()
+    }
+
+    const offSent = cdp.on('Network.requestWillBeSent', (params) => {
+      const event = params as { requestId?: string; request?: { url?: string; method?: string } }
+      // 第一个匹配的请求就是刚发出的这一轮:askExclusive 串行化了整个通路。
+      if (stream.requestId !== null || event.request?.url !== COMPLETION_URL) return
+      stream.requestId = event.requestId ?? null
+      nudge()
+    })
+    const offResponse = cdp.on('Network.responseReceived', (params) => {
+      const event = params as { requestId?: string; response?: { status?: number } }
+      if (event.requestId !== stream.requestId || stream.streaming) return
+      const status = event.response?.status ?? 0
+      if (status >= 400) {
+        stream.failure = { message: `DeepSeek 接口返回 HTTP ${status}。`, kind: classifyStatus(status) }
+        nudge()
+        return
+      }
+      void cdp.send<{ bufferedData?: string }>('Network.streamResourceContent', { requestId: stream.requestId })
+        .then((result) => {
+          stream.streaming = true
+          if (result.bufferedData) feed(Buffer.from(result.bufferedData, 'base64').toString('utf8'))
+          else nudge()
+        })
+        .catch((error: unknown) => {
+          stream.failure = {
+            message: `无法读取 DeepSeek 回复流：${error instanceof Error ? error.message : String(error)}`,
+            kind: 'transport',
+          }
+          nudge()
+        })
+    })
+    const offData = cdp.on('Network.dataReceived', (params) => {
+      const event = params as { requestId?: string; data?: string }
+      if (event.requestId !== stream.requestId) return
+      if (!stream.streaming || event.data === undefined) {
+        // 建流前的事件只报长度,字节由 bufferedData 一次补齐。
+        nudge()
+        return
+      }
+      feed(Buffer.from(event.data, 'base64').toString('utf8'))
+    })
+    const offFinished = cdp.on('Network.loadingFinished', (params) => {
+      if ((params as { requestId?: string }).requestId !== stream.requestId) return
+      stream.finished = true
+      nudge()
+    })
+    const offFailed = cdp.on('Network.loadingFailed', (params) => {
+      const event = params as { requestId?: string; errorText?: string }
+      if (event.requestId !== stream.requestId) return
+      stream.failure = { message: `DeepSeek 回复连接中断：${event.errorText ?? '未知原因'}`, kind: 'transport' }
+      nudge()
     })
 
-    try {
-      await cdp.send('Runtime.addBinding', { name: PUSH_BINDING })
-      await cdp.evaluate<boolean>(`window.__dshWeb.startWatch(${PUSH_THROTTLE_MS})`)
-    } catch {
-      // 推送挂不上就退回纯轮询,慢一点但不影响正确性。
+    const dispose = (): void => {
+      offSent()
+      offResponse()
+      offData()
+      offFinished()
+      offFailed()
     }
-
-    const take = (): PageSnapshot | undefined => {
-      const next = pushed
-      pushed = undefined
-      return next
-    }
-    const waitPush = (ms: number): Promise<void> => new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        wake = null
-        resolve()
-      }, ms)
-      wake = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-    })
 
     try {
-      yield* this.consume(cdp, baselineText, started, take, waitPush, signal)
-    } finally {
-      offBinding()
-      try {
-        await cdp.evaluate<boolean>('window.__dshWeb.stopWatch()')
-      } catch {
-        // 页面可能已经跳走,无所谓。
+      await cdp.send('Network.enable', {})
+    } catch (error: unknown) {
+      dispose()
+      throw error
+    }
+
+    const { idleTimeoutMs, hardTimeoutMs } = this
+    const events = async function* (signal?: AbortSignal): AsyncGenerator<BridgeEvent> {
+      for (;;) {
+        throwIfAborted(signal)
+        if (stream.failure !== null) throw new BridgeError(stream.failure.message, stream.failure.kind)
+        let sawFinish = false
+        while (pending.length > 0) {
+          // oxlint-disable-next-line typescript/no-non-null-assertion -- 循环条件保证非空
+          const event = pending.shift()!
+          switch (event.kind) {
+            case 'text':
+              yield { kind: 'text', text: event.delta }
+              break
+            case 'reasoning':
+              yield { kind: 'thinking', text: event.delta }
+              break
+            case 'usage':
+              yield { kind: 'usage', totalTokens: event.totalTokens }
+              break
+            case 'finished':
+              sawFinish = true
+              break
+            case 'undecodable':
+              yield { kind: 'diagnostic', text: `无法解析的回复帧，已跳过：${event.detail}` }
+              break
+          }
+        }
+        // 回复自报完成,或连接收尾:两者任一都不再有字节。
+        if (sawFinish || stream.finished) return
+        if (Date.now() - lastActivity > idleTimeoutMs) {
+          throw new BridgeError(
+            `DeepSeek ${Math.round(idleTimeoutMs / 1000)} 秒没有任何动静。` +
+              '可能卡在登录、风控或排队，请到浏览器里查看。',
+            'unknown',
+          )
+        }
+        if (Date.now() - started > hardTimeoutMs) {
+          throw new BridgeError('单轮等待超过上限，已放弃。', 'unknown')
+        }
+        if (stream.requestId === null && Date.now() - started > REQUEST_WAIT_MS) {
+          throw new BridgeError(
+            '发送后没有看到 DeepSeek 的回复请求，页面可能已改版。',
+            'transport',
+          )
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            wake = null
+            resolve()
+          }, POLL_INTERVAL_MS)
+          wake = () => {
+            clearTimeout(timer)
+            resolve()
+          }
+        })
       }
     }
-  }
 
-  /** The reply loop itself, fed by pushes with a poll as backstop. */
-  private async *consume(
-    cdp: CdpConnection,
-    baselineText: string,
-    started: number,
-    take: () => PageSnapshot | undefined,
-    waitPush: (ms: number) => Promise<void>,
-    signal?: AbortSignal,
-  ): AsyncGenerator<BridgeEvent> {
-    let lastActivity = started
-    let emitted = ''
-    let stableTicks = 0
-
-    for (;;) {
-      throwIfAborted(signal)
-      let snapshot: PageSnapshot | undefined = take()
-      if (!snapshot) {
-        try {
-          snapshot = await cdp.evaluate<PageSnapshot>('window.__dshWeb.snapshot()')
-        } catch (error) {
-          if (error instanceof CdpError) throw new BridgeError(error.message, 'transport')
-          throw error
-        }
-      }
-
-      if (snapshot.failed) {
-        throw new BridgeError(`DeepSeek 提示「${snapshot.failed}」。`, classify(snapshot.failed))
-      }
-
-      // 唯一判据:正文与发送前不同。
-      //
-      // 不能拿气泡数增长当判据 —— 提问气泡比回复气泡先出现,那一刻正文节点仍是
-      // 上一轮的回复,会被当成本轮新内容发出去,续轮的回答就以上一轮的回答开头。
-      // 代价是「本轮回答与上一轮逐字相同」时判不出来;但新回复的正文节点从空开始
-      // 逐字长,流式期间必然出现过中间态,采样到差异的概率极高,兜底还有 idle 超时。
-      const fresh = snapshot.text && snapshot.text !== baselineText ? snapshot.text : ''
-
-      if (fresh && fresh !== emitted) {
-        // 流式追加是常态;整段被改写(重新生成)时补发差值不成立,直接以新内容为准。
-        const delta = fresh.startsWith(emitted) ? fresh.slice(emitted.length) : fresh
-        emitted = fresh
-        stableTicks = 0
-        lastActivity = Date.now()
-        yield { kind: 'text', text: delta }
-      } else if (emitted) {
-        // 完成判定只看文本是否不再变化:站点改版后停止按钮已不可靠。
-        stableTicks += 1
-        if (stableTicks >= STABLE_TICKS_TO_FINISH && !snapshot.generating) return
-      }
-
-      if (snapshot.generating) {
-        lastActivity = Date.now()
-        // 思考期正文尚未出现,报活以免上层把仍在工作的请求判死。
-        if (!emitted) {
-          yield { kind: 'progress', text: `DeepSeek 正在思考…（${Math.round((Date.now() - started) / 1000)}s）` }
-        }
-      }
-
-      if (Date.now() - lastActivity > this.idleTimeoutMs) {
-        throw new BridgeError(
-          `DeepSeek 页面 ${Math.round(this.idleTimeoutMs / 1000)} 秒没有任何动静。` +
-            '可能卡在登录、风控或排队，请到浏览器里查看。',
-          'unknown',
-        )
-      }
-      if (Date.now() - started > this.hardTimeoutMs) {
-        throw new BridgeError('单轮等待超过上限，已放弃。', 'unknown')
-      }
-      // 有推送就立刻醒;没有就到点自查一次,让静默也能推进完成判定。
-      await waitPush(POLL_INTERVAL_MS)
-    }
+    return { events, dispose }
   }
 }
