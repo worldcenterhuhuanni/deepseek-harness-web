@@ -32,7 +32,11 @@ function decode(data: RawData): string {
   return Buffer.from(data as ArrayBuffer).toString('utf8')
 }
 
-/** Normalize the user-supplied endpoint into an absolute http origin. */
+/**
+ * 把用户填的地址规整成绝对的 http origin。
+ * @param endpoint - 配置里的调试端口地址，可省略协议，也可带尾部斜杠。
+ * @returns 带协议、无尾部斜杠的 origin。
+ */
 export function normalizeEndpoint(endpoint: string): string {
   const withScheme = /^https?:\/\//i.test(endpoint) ? endpoint : `http://${endpoint}`
   return withScheme.replace(/\/+$/, '')
@@ -44,7 +48,12 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return await response.json() as T
 }
 
-/** List page targets the browser currently exposes. */
+/**
+ * 列出浏览器当前暴露的所有可调试目标。
+ * @param endpoint - 调试端口地址，交给 {@link normalizeEndpoint} 规整。
+ * @param signal - 取消信号，会一路传给 fetch。
+ * @returns `/json/list` 返回的目标列表；HTTP 非 2xx 时抛 {@link CdpError}。
+ */
 export async function listTargets(endpoint: string, signal?: AbortSignal): Promise<CdpTarget[]> {
   return await getJson<CdpTarget[]>(`${normalizeEndpoint(endpoint)}/json/list`, signal)
 }
@@ -134,6 +143,15 @@ export class CdpConnection {
     })
   }
 
+  /**
+   * 连上一个目标的调试 WebSocket。
+   *
+   * 最大载荷放到 256 MiB：整段对话历史会通过一次 `Runtime.evaluate` 回传，默认上限
+   * （100 MiB）在长会话里会把连接直接断掉。
+   * @param wsUrl - 目标的 `webSocketDebuggerUrl`。
+   * @param signal - 取消信号；在连上之前中止会关掉这个 socket。
+   * @returns 已经连上的连接。
+   */
   static async open(wsUrl: string, signal?: AbortSignal): Promise<CdpConnection> {
     const socket = new WebSocket(wsUrl, { maxPayload: 256 * 1024 * 1024 })
     await new Promise<void>((resolve, reject) => {
@@ -205,14 +223,14 @@ export class CdpConnection {
   }
 
   /**
-   * Resolve on the next occurrence of one CDP event.
+   * 等某个 CDP 事件的下一次出现。
    *
-   * Register it *before* issuing the command that triggers it, or a fast event
-   * lands before anyone is listening. Resolves false on timeout rather than
-   * throwing: every caller here has a usable fallback path.
+   * 必须在发出触发它的命令**之前**注册，否则快事件会在还没人监听时就到了。超时返回
+   * false 而不是抛错：这里的每个调用方都有可用的兜底路径。
    *
-   * @param method - CDP event name, e.g. `Page.loadEventFired`.
-   * @param timeoutMs - give up after this long.
+   * @param method - CDP 事件名，例如 `Page.loadEventFired`。
+   * @param timeoutMs - 超过这个时长就放弃。
+   * @returns 事件到达返回 true；超时返回 false，不抛错。
    */
   once(method: string, timeoutMs: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -234,7 +252,12 @@ export class CdpConnection {
     })
   }
 
-  /** Issue one CDP command and await its result. */
+  /**
+   * 发一条 CDP 命令并等它的结果。
+   * @param method - CDP 方法名，例如 `Runtime.evaluate`。
+   * @param params - 该方法的参数对象；没有参数时整个字段不出现在报文里。
+   * @returns 命令的 result 字段。连接已关闭、发送失败或浏览器回错时抛错。
+   */
   async send<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
     if (this.closedReason) throw this.closedReason
     const id = ++this.seq
@@ -251,8 +274,9 @@ export class CdpConnection {
   }
 
   /**
-   * Evaluate an expression in the page and return its value.
-   * @param expression - JavaScript evaluated in the page's main world.
+   * 在页面里求值一个表达式并取回结果。
+   * @param expression - 在页面主世界里执行的 JavaScript；promise 会被等待。
+   * @returns 按值序列化回来的求值结果。页面脚本抛异常时转成 {@link CdpError}。
    */
   async evaluate<T>(expression: string): Promise<T> {
     const result = await this.send<{
@@ -270,7 +294,12 @@ export class CdpConnection {
     return result.result?.value as T
   }
 
-  /** Attach local files to the first file input matching `selector`. */
+  /**
+   * 把本地文件挂到第一个匹配 `selector` 的文件输入框上。
+   * @param selector - 定位 `input[type=file]` 的选择器。
+   * @param paths - 要挂载的本地文件绝对路径。
+   * @returns 挂载完成；页面上找不到该输入框时抛 {@link CdpError}。
+   */
   async setFileInput(selector: string, paths: readonly string[]): Promise<void> {
     const doc = await this.send<{ root: { nodeId: number } }>('DOM.getDocument', { depth: -1 })
     const { nodeId } = await this.send<{ nodeId: number }>('DOM.querySelector', {
@@ -281,6 +310,7 @@ export class CdpConnection {
     await this.send('DOM.setFileInputFiles', { nodeId, files: [...paths] })
   }
 
+  /** 主动关闭连接，并让所有在途命令以「连接已关闭」失败。 */
   close(): void {
     this.fail(new CdpError('CDP 连接已关闭。', 'close'))
     this.socket.close()

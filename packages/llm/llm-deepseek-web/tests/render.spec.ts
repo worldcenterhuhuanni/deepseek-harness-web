@@ -119,8 +119,9 @@ describe('preamble equivalence', () => {
 })
 
 describe('history rendering', () => {
-  it('replays historical calls in the fenced form the protocol asks for', () => {
-    // 模型会模仿历史里见过的写法;历史用裸 JSON 就等于示范了一种会被渲染破坏的格式。
+  it('replays historical calls in a form the model will not re-emit', () => {
+    // 用协议格式回放会让模型整段照抄(实测连我们生成的 id 一起复述),被认出来后就
+    // 会把同一处编辑重做一遍。格式示范由每轮在场的 preamble 承担,历史只要可读。
     const { history } = renderRequest(options({
       tools: TOOLS,
       messages: [
@@ -132,6 +133,9 @@ describe('history rendering', () => {
         },
       ],
     }))
-    expect(history).toContain('```json\n{"id":"c1","name":"read_file"')
+    expect(history).toContain('【已执行 c1 · read_file】')
+    expect(history).toContain('参数：{"path":"a.ts"}')
+    // 承重点:历史里不能出现协议标记,否则模型会当成待发出的调用照抄。
+    expect(history).not.toContain(TOOL_CALL_OPEN)
   })
 })

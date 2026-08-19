@@ -900,6 +900,7 @@ export interface DeepSeekCatalogModel {
 需要：`llm`
 
 ```ts config-catalog
+/** 插件配置，由同名的 schemastery schema 校验，并同时作为设置页的字段来源。 */
 export interface Config {
   /** 要驱动的 Chrome 调试端口地址。 */
   endpoint: string
@@ -930,7 +931,7 @@ export interface Config {
 
 依赖：[`RetryPolicyConfig`](../packages/llm/llm/src/index.ts)
 
-来源：[`packages/llm/llm-deepseek-web/src/index.ts:48`](../packages/llm/llm-deepseek-web/src/index.ts)
+来源：[`packages/llm/llm-deepseek-web/src/index.ts:49`](../packages/llm/llm-deepseek-web/src/index.ts)
 
 <a id="deepseek-aidsh-llm-pi-ai"></a>
 

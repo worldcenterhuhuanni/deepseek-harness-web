@@ -16,7 +16,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { normalizeEndpoint } from './cdp.ts'
 
-/** Where the dedicated browser profile lives when the user names none. */
+/**
+ * 用户没指定时，专用浏览器 profile 的落地位置。
+ * @returns `$DSH_HOME/deepseek-web-profile`；`DSH_HOME` 未设时退回 `~/.dsh`。
+ */
 export function defaultUserDataDir(): string {
   const home = process.env['DSH_HOME'] ?? join(homedir(), '.dsh')
   return join(home, 'deepseek-web-profile')
@@ -52,7 +55,10 @@ function candidatePaths(): string[] {
   return candidates
 }
 
-/** Resolve an executable Chrome, or undefined when none is installed where we look. */
+/**
+ * 按候选顺序找一个可执行的 Chrome。
+ * @returns 第一个存在的候选路径；我们找的位置都没有时返回 undefined。
+ */
 export async function findChrome(): Promise<string | undefined> {
   for (const candidate of candidatePaths()) {
     try {
@@ -65,7 +71,12 @@ export async function findChrome(): Promise<string | undefined> {
   return undefined
 }
 
-/** True once the DevTools endpoint answers. */
+/**
+ * 探测调试端口是否已经在应答。
+ * @param endpoint - 调试端口地址。
+ * @param timeoutMs - 单次探测的超时，默认 1 秒。
+ * @returns `/json/version` 返回 2xx 为 true；任何失败（含超时）都是 false，不抛错。
+ */
 export async function isEndpointUp(endpoint: string, timeoutMs = 1_000): Promise<boolean> {
   try {
     const response = await fetch(`${normalizeEndpoint(endpoint)}/json/version`, {
@@ -77,10 +88,15 @@ export async function isEndpointUp(endpoint: string, timeoutMs = 1_000): Promise
   }
 }
 
+/** 拉起并等待一个可调试浏览器所需的参数。 */
 export interface LaunchOptions {
+  /** 探测与等待用的调试端口地址。 */
   endpoint: string
+  /** 传给浏览器的 `--remote-debugging-port`。 */
   port: number
+  /** 传给浏览器的 `--user-data-dir`，与用户日常 profile 分开。 */
   userDataDir: string
+  /** 指定的 Chrome 可执行文件；不填则自动探测。 */
   chromePath?: string
   /** First page the new window lands on; defaults to DeepSeek so login is one click away. */
   startUrl?: string
@@ -91,8 +107,9 @@ export interface LaunchOptions {
 const DEFAULT_READY_TIMEOUT_MS = 30_000
 
 /**
- * Ensure a debuggable browser is listening, launching one if needed.
- * @returns whether this call started the browser.
+ * 确保有一个可调试的浏览器在监听，必要时拉起一个。
+ * @param options - 端口、profile 目录与可执行文件等启动参数。
+ * @returns 浏览器是否由本次调用启动（已在运行则为 false）。
  */
 export async function ensureChrome(options: LaunchOptions): Promise<boolean> {
   if (await isEndpointUp(options.endpoint)) return false

@@ -73,14 +73,13 @@ function renderBlocks(blocks: readonly ContentBlock[]): string {
         parts.push(`> （上一轮思考）${block.text}`)
         break
       case 'tool-call':
+        // 历史里的调用**不用**协议格式回放。用协议格式回放曾经是为了让模型看见正确
+        // 写法,但那也让它整段照抄:实测它复述过历史里的调用(连我们生成的 id 一起),
+        // 而那些调用一旦被重新执行就会把同一处编辑做第二遍。格式示范现在由每轮都
+        // 在场的 preamble 承担,所以这里只需可读、可与工具结果对上,且不像一条待发
+        // 出的指令。
         parts.push(
-          [
-            TOOL_CALL_OPEN,
-            '```json',
-            JSON.stringify({ id: block.id, name: block.name, arguments: safeParse(block.arguments) }),
-            '```',
-            TOOL_CALL_CLOSE,
-          ].join('\n'),
+          `【已执行 ${block.id} · ${block.name}】\n参数：${JSON.stringify(safeParse(block.arguments))}`,
         )
         break
       case 'tool-result': {

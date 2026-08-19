@@ -14,7 +14,9 @@
 
 import { jsonrepair } from 'jsonrepair'
 
+/** 协议约定的开标签；也用于历史回放与 {@link visibleEnd} 的扣留判断。 */
 export const TOOL_CALL_OPEN = '<tool_call>'
+/** 协议约定的闭标签；模型漏写它时边界改由围栏结束确定。 */
 export const TOOL_CALL_CLOSE = '</tool_call>'
 
 /** The literal that opens a marked call; the regex below allows attributes after it. */
@@ -36,24 +38,33 @@ const FENCE_RE = /```json[^\n]*\n([\s\S]*?)(?:\n```|$)/g
 const FENCE_ONE = /```json[^\n]*\n[\s\S]*?(?:\n```|$)/
 const CLOSE_RE = /<\/tool_call\s*>/i
 
+/**
+ * 切分回复得到的一段结果：可见文本，或一个调用的躯体。
+ *
+ * `raw` 在解析成功时携带规范化后的 JSON（含修复结果），失败时保留原文，由适配器
+ * 记一条 warn 后退回可见文本。
+ */
 export type SplitEvent =
   | { kind: 'text'; text: string }
   | { kind: 'tool-call'; raw: string }
 
+/** 一个已解析出来的调用。 */
 export interface ParsedToolCall {
+  /** 工具名；调用方负责校验它是否属于本轮提供的工具。 */
   name: string
-  /** Raw JSON string, matching `ToolCallBlock.arguments`. */
+  /** 参数的 JSON 文本，与 `ToolCallBlock.arguments` 对齐。 */
   arguments: string
 }
 
 /**
- * Parse one marker body; returns null when the model produced unusable JSON.
+ * 解析一段标记躯体；模型给出的 JSON 不可用时返回 null。
  *
- * The payload is the first balanced JSON object in `raw`, not `raw` itself. A
- * fenced block loses its backticks when the page renders it, and what survives
- * into `innerText` is the language tag plus the code block's own copy/download
- * button labels — `json\n复制\n下载\n{…}`. Parsing `raw` whole fails on that
- * debris; extracting the object skips any prefix and ignores any suffix.
+ * 载荷取的是 `raw` 里**第一个平衡的 JSON 对象**，而不是 `raw` 整体：代码块渲染后
+ * 反引号消失，留在 `innerText` 里的是语言标签加代码块自己的「复制/下载」按钮文字
+ * （`json\n复制\n下载\n{…}`），整段 parse 必然失败，而只取对象能跳过任何前缀、
+ * 忽略任何后缀。
+ * @param raw - 标记躯体或围栏内的原始文本。
+ * @returns 解析出的调用；JSON 不可用或缺 `name` 时返回 null。
  */
 export function parseToolCall(raw: string): ParsedToolCall | null {
   const open = raw.indexOf('{')

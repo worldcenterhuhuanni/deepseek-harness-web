@@ -13,6 +13,7 @@ import { defaultUserDataDir, ensureChrome } from './launch.ts'
 import { PAGE_AGENT, type PageSnapshot } from './page-agent.ts'
 import { CompletionStreamDecoder, type StreamEvent } from './sse.ts'
 
+/** 新对话导航到的站点地址。 */
 export const DEEPSEEK_URL = 'https://chat.deepseek.com/'
 
 /**
@@ -66,6 +67,7 @@ interface ReplyStream {
 /** Why a bridged request failed; the adapter maps this onto a dsh error code. */
 export type BridgeErrorKind = 'not-logged-in' | 'rate-limited' | 'transport' | 'unknown'
 
+/** 桥接层失败；`kind` 由适配器映射成 dsh 的错误码。 */
 export class BridgeError extends Error {
   constructor(message: string, readonly kind: BridgeErrorKind) {
     super(message)
@@ -73,7 +75,9 @@ export class BridgeError extends Error {
   }
 }
 
+/** 一次问答请求。 */
 export interface AskRequest {
+  /** 要填进输入框的文本；正文走附件时这里只有 preamble。 */
   prompt: string
   /**
    * Start a fresh web conversation instead of continuing the open one.
@@ -95,6 +99,7 @@ export interface AskRequest {
   signal?: AbortSignal
 }
 
+/** 构造一个网页会话所需的参数，全部来自插件 Config。 */
 export interface WebSessionOptions {
   /** Chrome DevTools endpoint, e.g. `http://127.0.0.1:9222`. */
   endpoint: string
@@ -185,6 +190,12 @@ function classify(message: string): BridgeErrorKind {
   return 'unknown'
 }
 
+/**
+ * 一条绑定到自己标签页的网页对话。
+ *
+ * 请求经由 {@link WebSession.ask} 串行化：一个标签页是一份物理资源，并发写同一个
+ * 输入框会让站点收到两段拼在一起的提示词。
+ */
 export class WebSession {
   private readonly endpoint: string
   private readonly autoLaunch: boolean
@@ -378,7 +389,11 @@ export class WebSession {
    */
   private readonly acquire = createGate()
 
-  /** Send one request and stream the reply, waiting for the tab to be free. */
+  /**
+   * 发一次请求并流式取回回复，先等标签页空出来。
+   * @param request - 提示词、是否新开对话、可选附件与取消信号。
+   * @returns 已分类的桥接事件流；失败时抛 {@link BridgeError}。
+   */
   async *ask(request: AskRequest): AsyncGenerator<BridgeEvent> {
     const release = await this.acquire()
     try {

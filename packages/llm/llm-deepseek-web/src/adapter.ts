@@ -75,7 +75,9 @@ interface Conversation {
 /** Advisory catalog entry; the web session exposes exactly one conversational model. */
 const WEB_MODEL = 'deepseek-web'
 
+/** 构造适配器所需的参数；可变项都以取值函数注入，便于每次请求现读。 */
 export interface DsWebAdapterOptions {
+  /** 承载问答的网页会话。 */
   session: WebSession
   displayName?: string
   /** Read per request, so a settings change reaches the next call without a restart. */
@@ -109,6 +111,12 @@ function bridgeErrorCode(kind: BridgeError['kind']): string {
   }
 }
 
+/**
+ * 把 dsh 的一次请求翻译成网页交互，再把网页文本翻回 chunk 流。
+ *
+ * 对外没有任何 provider 专属的东西：dsh 分辨不出一个调用是这里产出的还是 HTTP
+ * 适配器产出的。
+ */
 export class DsWebAdapter extends LlmAdapter {
   private readonly session: WebSession
   private readonly inlineLimit: () => number
