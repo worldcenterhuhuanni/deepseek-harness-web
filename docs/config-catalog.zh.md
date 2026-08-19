@@ -926,12 +926,28 @@ export interface Config {
   retryPolicy?: RetryPolicyConfig
   /** 工具调用解析不出时，按可重试失败处理，而不是当成一个已完成的回合。 */
   retryOnUnparsableCall: boolean
+  /** 站点拒绝发送时，按可重试失败处理；重试会先换一条网页对话。 */
+  retryOnBlockedPage: boolean
+  /** 等发送键从禁用变为可用的上限。 */
+  sendableTimeoutMs: number
+  /** 等一种提交方式生效（输入框清空）的上限。 */
+  submitTimeoutMs: number
+  /** 等附件上传并被站点解析完的上限。 */
+  attachTimeoutMs: number
+  /** 判定「未登录」的页面提示词表。 */
+  loginHints: string[]
+  /** 判定「附件挂载失败」的页面提示词表。 */
+  failHints: string[]
+  /** 判定「附件仍在上传或解析」的页面提示词表。 */
+  busyHints: string[]
+  /** 判定「站点拒绝发送」的页面提示词表。 */
+  blockedHints: string[]
 }
 ```
 
 依赖：[`RetryPolicyConfig`](../packages/llm/llm/src/index.ts)
 
-来源：[`packages/llm/llm-deepseek-web/src/index.ts:49`](../packages/llm/llm-deepseek-web/src/index.ts)
+来源：[`packages/llm/llm-deepseek-web/src/index.ts:67`](../packages/llm/llm-deepseek-web/src/index.ts)
 
 <a id="deepseek-aidsh-llm-pi-ai"></a>
 

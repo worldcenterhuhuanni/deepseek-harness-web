@@ -10,7 +10,7 @@
 
 import { CdpConnection, CdpError, closeTarget, createTarget, listTargets, type CdpTarget } from './cdp.ts'
 import { defaultUserDataDir, ensureChrome } from './launch.ts'
-import { PAGE_AGENT, type PageSnapshot } from './page-agent.ts'
+import { DEFAULT_PAGE_HINTS, PAGE_AGENT, type PageHints, type PageSnapshot } from './page-agent.ts'
 import { CompletionStreamDecoder, type StreamEvent } from './sse.ts'
 
 /** 新对话导航到的站点地址。 */
@@ -65,9 +65,16 @@ interface ReplyStream {
 }
 
 /** Why a bridged request failed; the adapter maps this onto a dsh error code. */
-export type BridgeErrorKind = 'not-logged-in' | 'rate-limited' | 'transport' | 'unknown'
+export type BridgeErrorKind = 'not-logged-in' | 'rate-limited' | 'transport' | 'page-blocked' | 'unknown'
 
-/** 桥接层失败；`kind` 由适配器映射成 dsh 的错误码。 */
+/**
+ * 桥接层失败；`kind` 由适配器映射成 dsh 的错误码。
+ *
+ * `page-blocked` 与 `transport` 的区别决定了上层能不能靠重发解决：`transport`
+ * 是一次偶发故障，原样重发就有希望；`page-blocked` 是站点在拒绝这个页面继续发送
+ * （输入区里留着上一次的残留），同一个页面重发多少次都是同一个结果，必须先换一条
+ * 通道。两者共用一个 kind 时，重试只会在同一个坏页面上反复堆残留。
+ */
 export class BridgeError extends Error {
   constructor(message: string, readonly kind: BridgeErrorKind) {
     super(message)
@@ -117,17 +124,29 @@ export interface WebSessionOptions {
   deepThinking?: boolean
   /** Turn the site's "web search" mode on before asking; off keeps first-token latency low. */
   webSearch?: boolean
+  /** 页面状态提示词表；每次读取页面时现取，配置改了下一次判定即生效。 */
+  pageHints?: () => PageHints
+  /** 等发送键从禁用变为可用的上限。 */
+  sendableTimeoutMs?: number
+  /** 等一种提交方式生效（输入框清空）的上限。 */
+  submitTimeoutMs?: number
+  /** 等附件上传并被站点解析完的上限。 */
+  attachTimeoutMs?: number
 }
 
-const DEFAULT_IDLE_TIMEOUT_MS = 180_000
-const DEFAULT_HARD_TIMEOUT_MS = 600_000
+/** 页面多久没有新内容就判本轮失败。 */
+export const DEFAULT_IDLE_TIMEOUT_MS = 180_000
+/** 单轮等待的绝对上限，与页面有没有动静无关。 */
+export const DEFAULT_HARD_TIMEOUT_MS = 600_000
 const POLL_INTERVAL_MS = 400
 const READY_TIMEOUT_MS = 30_000
 const NAVIGATION_TIMEOUT_MS = 30_000
-/** 上限而非固定等待:发送键通常几十毫秒内就绪。 */
-const SENDABLE_TIMEOUT_MS = 5_000
-/** 上限而非固定等待:等不到就说明回车没生效,退回去点发送控件。 */
-const SUBMIT_TIMEOUT_MS = 3_000
+/** 上限而非固定等待：发送键通常几十毫秒内就绪。 */
+export const DEFAULT_SENDABLE_TIMEOUT_MS = 5_000
+/** 上限而非固定等待：等不到就说明这一种提交方式没生效，换下一种。 */
+export const DEFAULT_SUBMIT_TIMEOUT_MS = 3_000
+/** 附件上传加站点解析的等待上限；大文件或慢网络需要更久。 */
+export const DEFAULT_ATTACH_TIMEOUT_MS = 120_000
 /** The site's own completion endpoint; its response body is the reply stream. */
 const COMPLETION_URL = 'https://chat.deepseek.com/api/v0/chat/completion'
 /** 发送后等这么久还没看到回复请求,就当页面改版了。 */
@@ -183,6 +202,28 @@ function classifyStatus(status: number): BridgeErrorKind {
   return 'unknown'
 }
 
+/**
+ * 把一次「发不出去」变成能自证的失败。
+ *
+ * 站点拒绝发送的理由只写在页面上，所以判定与消息都取自当下的页面文本：命中拒绝词表
+ * 就是 `page-blocked`，否则连输入区原文一起报出去。写死一句「页面可能已改版」会把真正
+ * 的原因（例如一张上传失败的附件卡片）藏起来，而那正是唯一能指向补救动作的信息。
+ * @param snapshot - 失败当刻的页面状态。
+ * @param what - 失败发生在哪一步，用作消息开头。
+ * @returns 已分类且带页面原文的失败。
+ */
+export function sendFailureFrom(snapshot: PageSnapshot, what: string): BridgeError {
+  if (snapshot.blocked) {
+    return new BridgeError(`${what}：DeepSeek 提示「${snapshot.blocked}」。`, 'page-blocked')
+  }
+  return new BridgeError(
+    snapshot.hint
+      ? `${what}。输入区当前显示：「${snapshot.hint}」`
+      : `${what}，且输入区没有任何提示文字。`,
+    'transport',
+  )
+}
+
 /** Classify a page-reported failure so dsh can route on it. */
 function classify(message: string): BridgeErrorKind {
   if (/未登录|登录|sign in|log in|验证码/i.test(message)) return 'not-logged-in'
@@ -205,6 +246,10 @@ export class WebSession {
   private readonly hardTimeoutMs: number
   private readonly deepThinking: boolean
   private readonly webSearch: boolean
+  private readonly pageHints: () => PageHints
+  private readonly sendableTimeoutMs: number
+  private readonly submitTimeoutMs: number
+  private readonly attachTimeoutMs: number
   /** The tab holding this session's conversation; null until one is bound. */
   private mainTargetId: string | null = null
 
@@ -217,6 +262,31 @@ export class WebSession {
     this.hardTimeoutMs = options.hardTimeoutMs ?? DEFAULT_HARD_TIMEOUT_MS
     this.deepThinking = options.deepThinking ?? false
     this.webSearch = options.webSearch ?? false
+    this.pageHints = options.pageHints ?? (() => DEFAULT_PAGE_HINTS)
+    this.sendableTimeoutMs = options.sendableTimeoutMs ?? DEFAULT_SENDABLE_TIMEOUT_MS
+    this.submitTimeoutMs = options.submitTimeoutMs ?? DEFAULT_SUBMIT_TIMEOUT_MS
+    this.attachTimeoutMs = options.attachTimeoutMs ?? DEFAULT_ATTACH_TIMEOUT_MS
+  }
+
+  /**
+   * 读一次页面状态，词表按当前配置传进去。
+   * @param cdp - 已连上目标标签页的连接。
+   * @returns 这一刻的页面状态。
+   */
+  private snapshot(cdp: CdpConnection): Promise<PageSnapshot> {
+    return cdp.evaluate<PageSnapshot>(
+      `window.__dshWeb.snapshot(${JSON.stringify(this.pageHints())})`,
+    )
+  }
+
+  /**
+   * 读一次页面状态，把它变成一个能自证的发送失败。
+   * @param cdp - 已连上目标标签页的连接。
+   * @param what - 失败发生在哪一步，用作消息开头。
+   * @returns 已分类且带页面原文的失败。
+   */
+  private async sendFailure(cdp: CdpConnection, what: string): Promise<BridgeError> {
+    return sendFailureFrom(await this.snapshot(cdp), what)
   }
 
   /** Port from the endpoint, needed as a launch flag. */
@@ -316,7 +386,7 @@ export class WebSession {
         await cdp.evaluate<boolean>(PAGE_AGENT)
         // 等待留在页面里:一次调用,输入框一出现就返回。
         await cdp.evaluate<boolean>(`window.__dshWeb.waitInput(${READY_TIMEOUT_MS})`)
-        const snapshot = await cdp.evaluate<PageSnapshot>('window.__dshWeb.snapshot()')
+        const snapshot = await this.snapshot(cdp)
         if (snapshot.hasInput) return snapshot
         if (!snapshot.loggedIn) {
           throw new BridgeError(
@@ -353,12 +423,17 @@ export class WebSession {
     await cdp.setFileInput(selector, [filePath])
     await cdp.evaluate<boolean>('window.__dshWeb.notifyFileAttached()')
 
-    const deadline = Date.now() + 120_000
+    const deadline = Date.now() + this.attachTimeoutMs
     for (;;) {
       throwIfAborted(signal)
-      const snapshot = await cdp.evaluate<PageSnapshot>('window.__dshWeb.snapshot()')
+      const snapshot = await this.snapshot(cdp)
       if (snapshot.failed) {
         throw new BridgeError(`DeepSeek 提示「${snapshot.failed}」，附件未能挂上。`, classify(snapshot.failed))
+      }
+      // 站点已经在拒绝发送,再等下去只会等到超时,而超时报的是「解析超时」——
+      // 与真正的原因无关。
+      if (snapshot.blocked) {
+        throw new BridgeError(`DeepSeek 提示「${snapshot.blocked}」，这个页面已经发不出消息。`, 'page-blocked')
       }
       if (!snapshot.busy) {
         yield { kind: 'progress', text: '附件已就绪。' }
@@ -506,14 +581,17 @@ export class WebSession {
     const typed = await cdp.evaluate<string>('window.__dshWeb.inputValue()')
     if (!typed) throw new BridgeError('提示词没有写进 DeepSeek 输入框。', 'transport')
 
-    // 等发送键真的变可用再动手,而不是睡一个猜出来的固定时长。
-    await cdp.evaluate<boolean>(`window.__dshWeb.waitSendable(${SENDABLE_TIMEOUT_MS})`)
+    // 等发送键真的变可用再动手,而不是睡一个猜出来的固定时长。等不到就说明站点
+    // 主动禁用了它,这时三种提交方式都注定无效,报出页面的理由比试一遍更有用。
+    if (!await cdp.evaluate<boolean>(`window.__dshWeb.waitSendable(${this.sendableTimeoutMs})`)) {
+      throw await this.sendFailure(cdp, '发送键一直不可用')
+    }
 
     // 首选元素自身的 click():实测三种提交方式只有它稳定生效,回车与完整鼠标序列
     // 都失败过。键鼠事件依赖窗口/焦点状态,而这个插件的正常形态就是在后台跑,
     // DOM 调用不受这些影响,所以把最可靠的一条放在最前面。
     await cdp.evaluate<boolean>('window.__dshWeb.clickSend()')
-    if (await cdp.evaluate<boolean>(`window.__dshWeb.waitSubmitted(${SUBMIT_TIMEOUT_MS})`)) return
+    if (await cdp.evaluate<boolean>(`window.__dshWeb.waitSubmitted(${this.submitTimeoutMs})`)) return
 
     // 兜底一:窗口在前台时真实鼠标点击更接近用户操作。
     yield { kind: 'progress', text: '点击未生效，尝试真实鼠标事件…' }
@@ -524,7 +602,7 @@ export class WebSession {
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y, buttons: 0 })
       await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount: 1 })
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1 })
-      if (await cdp.evaluate<boolean>(`window.__dshWeb.waitSubmitted(${SUBMIT_TIMEOUT_MS})`)) return
+      if (await cdp.evaluate<boolean>(`window.__dshWeb.waitSubmitted(${this.submitTimeoutMs})`)) return
     }
 
     // 兜底二:回车。
@@ -538,12 +616,9 @@ export class WebSession {
         nativeVirtualKeyCode: 13,
       })
     }
-    if (await cdp.evaluate<boolean>(`window.__dshWeb.waitSubmitted(${SUBMIT_TIMEOUT_MS})`)) return
+    if (await cdp.evaluate<boolean>(`window.__dshWeb.waitSubmitted(${this.submitTimeoutMs})`)) return
 
-    throw new BridgeError(
-      '无法发送消息：点击与回车都没有让输入框清空，页面可能已改版。',
-      'transport',
-    )
+    throw await this.sendFailure(cdp, '无法发送消息：点击与回车都没有让输入框清空')
   }
 
   /**

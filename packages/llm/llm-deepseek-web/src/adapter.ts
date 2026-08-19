@@ -54,6 +54,15 @@ export const DEFAULT_INLINE_LIMIT = 4_000
  */
 export const UNPARSABLE_CALL_CODE = 'UNPARSABLE_TOOL_CALL'
 
+/**
+ * 站点拒绝这个页面继续发送时的错误码。
+ *
+ * 与 `TRANSPORT` 分开，因为两者的补救动作不同：`TRANSPORT` 原样重发即可，而这一种
+ * 必须先换一条网页对话——{@link DsWebAdapter} 收到它就把当前通道记为不可用，
+ * 下一次请求因此走新开对话的路径。共用 `TRANSPORT` 时重试只会在同一个坏页面上重发。
+ */
+export const BLOCKED_PAGE_CODE = 'PAGE_BLOCKED'
+
 /** A content block currently accumulating deltas. */
 interface OpenBlock {
   index: number
@@ -88,6 +97,8 @@ export interface DsWebAdapterOptions {
   retryPolicy?: () => ResolvedRetryPolicy
   /** 解析不出的工具调用是否加入策略的可重试错误码。 */
   retryOnUnparsableCall?: () => boolean
+  /** 站点拒绝发送是否加入策略的可重试错误码；重试会先换一条网页对话。 */
+  retryOnBlockedPage?: () => boolean
   /**
    * Where to report resume-vs-restart decisions and protocol violations;
    * without it they are silent. `warn` marks a degraded turn — the model
@@ -106,6 +117,8 @@ function bridgeErrorCode(kind: BridgeError['kind']): string {
       return 'RATE_LIMIT'
     case 'transport':
       return 'TRANSPORT'
+    case 'page-blocked':
+      return BLOCKED_PAGE_CODE
     default:
       return 'UNKNOWN'
   }
@@ -124,6 +137,7 @@ export class DsWebAdapter extends LlmAdapter {
   private readonly displayName: string
   private readonly retryPolicy: (() => ResolvedRetryPolicy) | undefined
   private readonly retryOnUnparsableCall: () => boolean
+  private readonly retryOnBlockedPage: () => boolean
   private readonly log: ((message: string, level?: 'info' | 'warn') => void) | undefined
   /**
    * The web conversation currently open, or null when the next request must
@@ -131,6 +145,16 @@ export class DsWebAdapter extends LlmAdapter {
    * 各自退回新开会话 —— 慢但不会串话,要真并发得先做多标签页。
    */
   private conversation: Conversation | null = null
+  /**
+   * 上一轮把当前通道判成不可用的理由，null 表示通道可用。
+   *
+   * 与 {@link DsWebAdapter.conversation} 是两个相互独立的维度：前者说的是「网页那边
+   * 记着的内容还能不能当增量基线」，这里说的是「承载它的那个页面还能不能发出消息」。
+   * 内容有效而通道不可用是真实存在的状态——站点在输入区留下一张上传失败的附件卡片
+   * 就会禁用发送键，对话内容一个字没变，但这个页面再也发不出东西。只看内容维度就会
+   * 一直复用那个页面，每次重试再堆一张残留。
+   */
+  private channelBlocked: string | null = null
 
   constructor(options: DsWebAdapterOptions) {
     super()
@@ -140,6 +164,7 @@ export class DsWebAdapter extends LlmAdapter {
     this.displayName = options.displayName ?? 'DeepSeek 网页（已登录）'
     this.retryPolicy = options.retryPolicy
     this.retryOnUnparsableCall = options.retryOnUnparsableCall ?? (() => true)
+    this.retryOnBlockedPage = options.retryOnBlockedPage ?? (() => true)
     this.log = options.log
   }
 
@@ -148,20 +173,24 @@ export class DsWebAdapter extends LlmAdapter {
   }
 
   /**
-   * 配置里的策略，追加上「调用解析不出」这一种。
+   * 配置里的策略，追加上本路由自己那两种可恢复失败。
    *
-   * 追加而不是替换，是为了让部署自己的错误码、退避与次数上限仍然作准；
-   * `retryOnUnparsableCall: false` 可以退出这个行为，而 `always` 策略本来就重试一切。
+   * 追加而不是替换，是为了让部署自己的错误码、退避与次数上限仍然作准；两个
+   * `retryOn*` 开关各自可以退出，而 `always` 策略本来就重试一切。
    * @param _provider - 本适配器拥有的一条路由。
    * @returns 随路由一起捕获的策略；返回 undefined 表示沿用 seam 默认。
    */
   override providerRetryPolicy(_provider: string): ResolvedRetryPolicy | undefined {
     const policy = this.retryPolicy?.()
-    if (policy === undefined || !this.retryOnUnparsableCall()) return policy
-    if (policy.mode !== 'normal' || policy.retryableCodes.includes(UNPARSABLE_CALL_CODE)) return policy
+    if (policy === undefined || policy.mode !== 'normal') return policy
+    const extra = [
+      ...this.retryOnUnparsableCall() ? [UNPARSABLE_CALL_CODE] : [],
+      ...this.retryOnBlockedPage() ? [BLOCKED_PAGE_CODE] : [],
+    ].filter(code => !policy.retryableCodes.includes(code))
+    if (extra.length === 0) return policy
     return Object.freeze({
       ...policy,
-      retryableCodes: Object.freeze([...policy.retryableCodes, UNPARSABLE_CALL_CODE]),
+      retryableCodes: Object.freeze([...policy.retryableCodes, ...extra]),
     })
   }
 
@@ -205,8 +234,14 @@ export class DsWebAdapter extends LlmAdapter {
     // 走人,让它们共用主标签页会把主对话导航掉,下一轮就得导航回去重载整段历史。
     // 所以它们在一次性标签页里跑,也完全不参与这里的会话记账。
     const isolated = !isAgentLoopRequest(options)
+    // 通道维度先判:内容基线可能还完全有效,但那个页面已经发不出消息,继续复用只会
+    // 在同一个页面上重复失败。读完即清 —— 新开的对话就是一条新通道。
+    const blocked = this.channelBlocked
+    if (!isolated) this.channelBlocked = null
     // 续问只发新增:网页会话自己记着前面的轮次,重发全量既慢又会让历史重复叠加。
-    const blocker = isolated ? '这是一次性请求（非 agent loop）' : this.resumeBlocker(options)
+    const blocker = isolated
+      ? '这是一次性请求（非 agent loop）'
+      : blocked ?? this.resumeBlocker(options)
     const resumeAt = blocker === null ? this.conversation?.sentIds.length ?? 0 : 0
     this.log?.(
       blocker === null
@@ -399,6 +434,11 @@ export class DsWebAdapter extends LlmAdapter {
       // 产出了什么都无从确认,继续用会让下一轮的增量建立在错误的基线上。
       if (submitted && !isolated) this.conversation = null
       if (error instanceof BridgeError) {
+        // 提交之前失败并不总是无害:站点拒绝发送时,页面本身已经报废,只有内容基线
+        // 还留着。把通道单独记下来,下一轮才知道要换一条,而不是继续用这个页面。
+        if (error.kind === 'page-blocked' && !isolated) {
+          this.channelBlocked = `上一轮${error.message}`
+        }
         throw new LlmError(error.message, bridgeErrorCode(error.kind), { cause: error })
       }
       throw error

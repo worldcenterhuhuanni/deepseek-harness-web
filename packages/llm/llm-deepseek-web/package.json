@@ -32,7 +32,7 @@
   ],
   "license": "MIT",
   "scripts": {
-    "start": "node launcher/install-profile.mjs && pnpm -w dsh web"
+    "start": "node launcher/install-profile.mjs && pnpm -w run dsh web"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "workspace:^",

@@ -175,6 +175,9 @@ export default defineConfig({
         'packages/self-modification/*/src/**/*.{ts,tsx}',
         // A killed executable lint-contract test can leave a non-product source probe behind.
         'packages/*/*/src/oxlint-contract-*.ts',
+        // 网页桥的驱动层要真实 Chrome、CDP 连接与已登录会话,jsdom 泳道给不了。
+        // 纯逻辑部分(page-agent 的状态判定、parse、render、sse)由该包单测覆盖。
+        'packages/llm/llm-deepseek-web/src/**/*.ts',
         // Client/web UI files whose remaining branches need a browser-grade
         // harness the jsdom lane doesn't cover yet. TODO(gui): cover and
         // remove as the client test lane matures.

@@ -21,18 +21,36 @@ import { resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
 import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { DEFAULT_INLINE_LIMIT, DsWebAdapter } from './adapter.ts'
-import { WebSession } from './session.ts'
+import { DEFAULT_PAGE_HINTS } from './page-agent.ts'
+import {
+  DEFAULT_ATTACH_TIMEOUT_MS,
+  DEFAULT_HARD_TIMEOUT_MS,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_SENDABLE_TIMEOUT_MS,
+  DEFAULT_SUBMIT_TIMEOUT_MS,
+  WebSession,
+} from './session.ts'
 
 export { DsWebAdapter, DEFAULT_INLINE_LIMIT } from './adapter.ts'
-export { BridgeError, WebSession, DEEPSEEK_URL } from './session.ts'
+export {
+  BridgeError,
+  sendFailureFrom,
+  WebSession,
+  DEEPSEEK_URL,
+  DEFAULT_ATTACH_TIMEOUT_MS,
+  DEFAULT_HARD_TIMEOUT_MS,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_SENDABLE_TIMEOUT_MS,
+  DEFAULT_SUBMIT_TIMEOUT_MS,
+} from './session.ts'
 export { CdpConnection, CdpError, listTargets, createTarget, closeTarget, normalizeEndpoint } from './cdp.ts'
 export { defaultUserDataDir, ensureChrome, findChrome, isEndpointUp } from './launch.ts'
 export { splitReply, parseToolCall, visibleEnd } from './parse.ts'
 export { CompletionStreamDecoder } from './sse.ts'
 export type { StreamEvent } from './sse.ts'
 export { renderRequest } from './render.ts'
-export { PAGE_AGENT } from './page-agent.ts'
-export type { PageSnapshot } from './page-agent.ts'
+export { PAGE_AGENT, DEFAULT_PAGE_HINTS } from './page-agent.ts'
+export type { PageHints, PageSnapshot } from './page-agent.ts'
 
 export const name = 'llm-deepseek-web'
 export const inject = ['llm']
@@ -71,6 +89,22 @@ export interface Config {
   retryPolicy?: RetryPolicyConfig
   /** 工具调用解析不出时，按可重试失败处理，而不是当成一个已完成的回合。 */
   retryOnUnparsableCall: boolean
+  /** 站点拒绝发送时，按可重试失败处理；重试会先换一条网页对话。 */
+  retryOnBlockedPage: boolean
+  /** 等发送键从禁用变为可用的上限。 */
+  sendableTimeoutMs: number
+  /** 等一种提交方式生效（输入框清空）的上限。 */
+  submitTimeoutMs: number
+  /** 等附件上传并被站点解析完的上限。 */
+  attachTimeoutMs: number
+  /** 判定「未登录」的页面提示词表。 */
+  loginHints: string[]
+  /** 判定「附件挂载失败」的页面提示词表。 */
+  failHints: string[]
+  /** 判定「附件仍在上传或解析」的页面提示词表。 */
+  busyHints: string[]
+  /** 判定「站点拒绝发送」的页面提示词表。 */
+  blockedHints: string[]
 }
 
 export const Config: z<Config> = z.object({
@@ -86,9 +120,9 @@ export const Config: z<Config> = z.object({
     .description('超过该字符数的请求改用 .md 附件发送，而不是打进输入框。'),
   useAttachment: z.boolean().default(true)
     .description('关闭后一律走输入框；网页端拒收 .md 附件时用它兜底。'),
-  idleTimeoutMs: z.number().step(1).min(1_000).default(180_000)
+  idleTimeoutMs: z.number().step(1).min(1_000).default(DEFAULT_IDLE_TIMEOUT_MS)
     .description('页面多久没有任何动静就判定失败。'),
-  hardTimeoutMs: z.number().step(1).min(1_000).default(600_000)
+  hardTimeoutMs: z.number().step(1).min(1_000).default(DEFAULT_HARD_TIMEOUT_MS)
     .description('单轮等待的绝对上限。'),
   deepThinking: z.boolean().default(false)
     .description('是否开启网页端「深度思考」。开启会显著拉长首字延迟。'),
@@ -97,6 +131,22 @@ export const Config: z<Config> = z.object({
     .description('模型写出的调用完全解析不出时，按重试策略重发本轮请求，而不是把回合当成已完成。'),
   webSearch: z.boolean().default(false)
     .description('是否开启网页端「智能搜索」。站点默认开启，但每轮联网搜索会让首字延迟高达 30 秒以上。'),
+  retryOnBlockedPage: z.boolean().default(true)
+    .description('站点拒绝发送时重发本轮请求，并先换一条网页对话；关掉会让这一轮直接失败。'),
+  sendableTimeoutMs: z.number().step(1).min(100).default(DEFAULT_SENDABLE_TIMEOUT_MS)
+    .description('等发送键变为可用的上限，超过即按「站点禁用了发送」处理。'),
+  submitTimeoutMs: z.number().step(1).min(100).default(DEFAULT_SUBMIT_TIMEOUT_MS)
+    .description('等一种提交方式生效的上限，超过就换下一种。'),
+  attachTimeoutMs: z.number().step(1).min(1_000).default(DEFAULT_ATTACH_TIMEOUT_MS)
+    .description('等附件上传并被站点解析完的上限；文件大或网络慢时调高。'),
+  loginHints: z.array(z.string()).default([...DEFAULT_PAGE_HINTS.login])
+    .description('页面出现这些词即判定未登录。'),
+  failHints: z.array(z.string()).default([...DEFAULT_PAGE_HINTS.fail])
+    .description('输入区出现这些词即判定本次附件挂载失败。'),
+  busyHints: z.array(z.string()).default([...DEFAULT_PAGE_HINTS.busy])
+    .description('输入区出现这些词即认为附件还在上传或解析。'),
+  blockedHints: z.array(z.string()).default([...DEFAULT_PAGE_HINTS.blocked])
+    .description('输入区出现这些词即判定站点拒绝发送，换一条网页对话再发；站点改了文案就在这里补。'),
 })
 
 export function apply(ctx: Context, config: Config): void {
@@ -114,6 +164,14 @@ export function apply(ctx: Context, config: Config): void {
     // 空字符串代表「用默认」,不能当成显式配置传下去。
     ...config.userDataDir ? { userDataDir: config.userDataDir } : {},
     ...config.chromePath ? { chromePath: config.chromePath } : {},
+    sendableTimeoutMs: config.sendableTimeoutMs,
+    submitTimeoutMs: config.submitTimeoutMs,
+    attachTimeoutMs: config.attachTimeoutMs,
+    // 词表每次读页面现取:站点改了文案,用户在设置里补一条就生效,不必重启。
+    pageHints: () => {
+      const now = current()
+      return { login: now.loginHints, fail: now.failHints, busy: now.busyHints, blocked: now.blockedHints }
+    },
   })
   const adapter = new DsWebAdapter({
     session,
@@ -122,6 +180,7 @@ export function apply(ctx: Context, config: Config): void {
     // 每次请求现读:设置里改了策略,下一次调用即生效。
     retryPolicy: () => resolveRetryPolicy(current().retryPolicy, `${NS}: retryPolicy`),
     retryOnUnparsableCall: () => current().retryOnUnparsableCall,
+    retryOnBlockedPage: () => current().retryOnBlockedPage,
     // 网页那边意外多出一堆独立对话时,这条日志是唯一能说清为什么的东西。
     log: (message, level) => {
       const line = `llm-deepseek-web: ${message}`

@@ -27,6 +27,52 @@ export interface PageSnapshot {
   failedElsewhere: string
   /** An attachment is still uploading or parsing. */
   busy: boolean
+  /**
+   * 站点明确拒绝发送时命中的整行原文，未命中为空串。
+   *
+   * 与 {@link PageSnapshot.failed} 分开：`failed` 说的是这一次挂载没成功，重挂
+   * 一次可能就好；`blocked` 说的是输入区里还留着上一次的残留（例如上传失败的附件
+   * 卡片），站点会一直禁用发送键，在同一个页面重发多少次都发不出去。
+   */
+  blocked: string
+  /**
+   * 输入区文本的尾部原文，恒有值。
+   *
+   * 词表只认得已知提示。站点换了文案或给出没见过的拒绝理由时，这段原文是错误消息
+   * 里唯一能说清「页面当时到底显示了什么」的东西——否则只能猜「页面可能已改版」。
+   */
+  hint: string
+}
+
+/**
+ * 页面状态的提示词表，每项都是拼进正则的源字符串。
+ *
+ * 全部由宿主按配置传入而不写死在脚本里：站点改一次文案就够让写死的词表失灵，
+ * 而这样用户改 cordis.yml 即可自救，不必等插件发版。
+ */
+export interface PageHints {
+  /** 命中即认为未登录。 */
+  login: readonly string[]
+  /** 命中即认为这一次附件挂载失败。 */
+  fail: readonly string[]
+  /** 命中即认为附件还在上传或解析。 */
+  busy: readonly string[]
+  /** 命中即认为站点在拒绝发送，换一条通道之前都发不出去。 */
+  blocked: readonly string[]
+}
+
+/**
+ * 提示词表的默认值，也是插件 Config 的默认值来源。
+ *
+ * 只在这里定义一份：默认词表分散在脚本与 Config 两处时，改了一处就与另一处不符，
+ * 而两处的差异只会在站点真的显示那句提示时才暴露。
+ */
+export const DEFAULT_PAGE_HINTS: PageHints = {
+  login: ['登录', 'sign in', 'log in', '驗證', '验证码'],
+  fail: ['解析失败', '未能发送', '发送失败', 'upload failed', 'parse failed'],
+  busy: ['解析中', '上传中', '处理中', 'Uploading', 'Parsing', 'Loading'],
+  // 站点用这几句拒绝发送:附件上传失败后留下的卡片必须先删掉,否则发送键一直禁用。
+  blocked: ['请删除异常文件', '异常文件', '服务器繁忙', '内容过长', '超出长度限制'],
 }
 
 /**
@@ -52,9 +98,32 @@ export const PAGE_AGENT = String.raw`
   ];
   // 回复内容不从 DOM 读:那需要盯站点的混淆 class,而且拿到的是渲染结果。
   // 这里只留输入、发送、登录/忙碌状态所需的选择器 —— 都是语义化属性。
-  const LOGIN_HINT = /登录|sign in|log in|驗證|验证码/i;
-  const FAIL_HINT = /解析失败|未能发送|发送失败|upload failed|parse failed/i;
-  const BUSY_HINT = /解析中|上传中|处理中|Uploading|Parsing|Loading/i;
+  // 提示原文的截断长度与命中词前后保留的上下文长度。纯展示细节,不随部署变化。
+  const HINT_MAX = 200;
+  const HINT_PAD = 60;
+
+  /** 把词表拼成一个正则;空词表返回 null,表示这一类提示不判定。 */
+  function anyOf(list) {
+    return list && list.length ? new RegExp(list.join('|'), 'i') : null;
+  }
+
+  /**
+   * 命中词连同它前后的一段原文,而不只是关键词。
+   *
+   * 站点把理由写在关键词周围(「文件上传失败,请删除异常文件再发送」),只回关键词
+   * 就把理由丢了。不按 innerText 的换行切:换行取决于渲染,拿不到时会退化成整段文本。
+   */
+  function hitLine(re, text) {
+    if (!re) return '';
+    const m = text.match(re);
+    if (!m) return '';
+    // 真实页面的 innerText 带换行,命中所在的那一行正是站点写给用户的那句话。
+    // 拿不到换行时(整段连成一行)退回按字符取窗口,否则会把整段文本都当成提示。
+    const line = text.split('\n').find((l) => re.test(l));
+    if (line !== undefined && line.length <= HINT_MAX) return line.trim();
+    const from = Math.max(0, m.index - HINT_PAD);
+    return text.slice(from, m.index + m[0].length + HINT_PAD).trim().slice(0, HINT_MAX);
+  }
 
   function findInput() {
     for (const s of INPUT_SELECTORS) {
@@ -96,10 +165,10 @@ export const PAGE_AGENT = String.raw`
     return byLabel || null;
   }
 
-  function isLoggedIn() {
+  function isLoggedIn(loginRe) {
     if (findInput()) return true;
     const body = (document.body && document.body.innerText ? document.body.innerText.slice(0, 2000) : '');
-    if (LOGIN_HINT.test(body)) return false;
+    if (loginRe && loginRe.test(body)) return false;
     if (document.querySelector('input[type="password"], .ds-sign-in-form__main, .ds-auth-form-wrapper')) return false;
     return Boolean(findInput());
   }
@@ -172,22 +241,25 @@ export const PAGE_AGENT = String.raw`
       }, timeoutMs);
     },
 
-    snapshot() {
-      // 状态只在输入区里找。FAIL_HINT/BUSY_HINT 命中的是站点贴在附件卡片与输入区
-      // 的提示,而 document.body.innerText 含整段对话历史 —— 一旦对话本身谈到
-      // 「解析失败」「处理中」这类词,内容就会被读成状态,而且历史不会消失,于是
-      // 从那一轮起每轮都失败:附件判失败(报错文本其实来自对话),或永久 busy 等到超时。
+    snapshot(hints) {
+      // 状态只在输入区里找。词表命中的是站点贴在附件卡片与输入区的提示,而
+      // document.body.innerText 含整段对话历史 —— 一旦对话本身谈到「解析失败」
+      // 「处理中」这类词,内容就会被读成状态,而且历史不会消失,于是从那一轮起每轮
+      // 都失败:附件判失败(报错文本其实来自对话),或永久 busy 等到超时。
+      const h = hints || {};
+      const failRe = anyOf(h.fail);
       const box = composerBox();
       const text = (box && box.innerText) || '';
-      const failMatch = text.match(FAIL_HINT);
+      const failed = hitLine(failRe, text);
       const whole = (document.body && document.body.innerText) || '';
-      const outside = failMatch ? null : whole.match(FAIL_HINT);
       return {
-        loggedIn: isLoggedIn(),
+        loggedIn: isLoggedIn(anyOf(h.login)),
         hasInput: Boolean(findInput()),
-        failed: failMatch ? failMatch[0] : '',
-        failedElsewhere: outside ? outside[0] : '',
-        busy: BUSY_HINT.test(text),
+        failed: failed,
+        failedElsewhere: failed ? '' : hitLine(failRe, whole),
+        busy: Boolean(anyOf(h.busy) && anyOf(h.busy).test(text)),
+        blocked: hitLine(anyOf(h.blocked), text),
+        hint: text.trim().slice(-HINT_MAX),
       };
     },
 

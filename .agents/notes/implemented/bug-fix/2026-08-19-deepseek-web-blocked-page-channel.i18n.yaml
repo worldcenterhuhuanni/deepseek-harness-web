@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-08-19-deepseek-web-blocked-page-channel.md
+2026-08-19-deepseek-web-blocked-page-channel.md: 0d0043aa1979cd248d97c90d03bce8991f03beb4
+2026-08-19-deepseek-web-blocked-page-channel.zh.md: 97187c307be7550d140115a59c4600199c2dc884

@@ -14,13 +14,14 @@
 
 import { JSDOM } from 'jsdom'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { PAGE_AGENT, type PageSnapshot } from '../src/page-agent.ts'
+import { DEFAULT_PAGE_HINTS, PAGE_AGENT, type PageHints, type PageSnapshot } from '../src/page-agent.ts'
+import { sendFailureFrom } from '../src/session.ts'
 
 /** Composer nested deep enough that `composerBox()` (input + 6 parents) excludes the transcript. */
 const composer = (extra = '') =>
   `<div><div><div><div><div><div>${extra}<textarea placeholder="给 DeepSeek 发送消息"></textarea></div></div></div></div></div></div>`
 
-function pageWith(transcript: string, composerExtra = ''): PageSnapshot {
+function pageWith(transcript: string, composerExtra = '', hints: PageHints = DEFAULT_PAGE_HINTS): PageSnapshot {
   const dom = new JSDOM(
     `<body><div id="app"><div id="chat">${transcript}</div>${composer(composerExtra)}</div></body>`,
     { runScripts: 'outside-only' },
@@ -31,12 +32,57 @@ function pageWith(transcript: string, composerExtra = ''): PageSnapshot {
     get(this: HTMLElement) { return this.textContent },
   })
   dom.window.eval(PAGE_AGENT)
-  return (dom.window as unknown as { __dshWeb: { snapshot(): PageSnapshot } }).__dshWeb.snapshot()
+  return (dom.window as unknown as { __dshWeb: { snapshot(h: PageHints): PageSnapshot } })
+    .__dshWeb.snapshot(hints)
 }
+
+describe('a send failure explains itself from the page', () => {
+  const base = { loggedIn: true, hasInput: true, failed: '', failedElsewhere: '', busy: false }
+
+  it('names the site refusal and asks for a different channel', () => {
+    const error = sendFailureFrom({ ...base, blocked: '请删除异常文件再发送', hint: '请删除异常文件再发送' }, '无法发送消息')
+    // 分类决定补救动作:page-blocked 才会让下一轮换一条网页对话。
+    expect(error.kind).toBe('page-blocked')
+    expect(error.message).toContain('请删除异常文件再发送')
+  })
+
+  it('quotes the composer verbatim when no hint word matches', () => {
+    // 站点换了文案时的唯一线索。旧实现在这里写死「页面可能已改版」,把真正的原因藏掉了。
+    const error = sendFailureFrom({ ...base, blocked: '', hint: '本对话已达上限，请开启新对话' }, '无法发送消息')
+    expect(error.kind).toBe('transport')
+    expect(error.message).toContain('本对话已达上限')
+  })
+
+  it('says so when the composer shows nothing at all', () => {
+    const error = sendFailureFrom({ ...base, blocked: '', hint: '' }, '无法发送消息')
+    expect(error.kind).toBe('transport')
+    expect(error.message).toContain('没有任何提示文字')
+  })
+})
 
 describe('snapshot state detection', () => {
   let sane: PageSnapshot
   beforeEach(() => { sane = pageWith('你好。<br>好的，我来看一下。') })
+
+  it('reports the site refusing to send, apart from a failed attachment', () => {
+    // 这一条与 failed 的区别决定上层要不要换通道:残留不清掉,同一个页面永远发不出去。
+    const snapshot = pageWith('无关对话', '<div>文件上传失败，请删除异常文件再发送</div>')
+    expect(snapshot.blocked).toContain('请删除异常文件')
+    expect(snapshot.hint).toContain('请删除异常文件')
+  })
+
+  it('always carries the composer text so an unknown refusal is still legible', () => {
+    // 词表只认得已知文案。站点换了说法时,这段原文是错误消息里唯一的线索。
+    const snapshot = pageWith('无关对话', '<div>本对话已达上限，请开启新对话</div>')
+    expect(snapshot.blocked).toBe('')
+    expect(snapshot.hint).toContain('本对话已达上限')
+  })
+
+  it('judges nothing when a hint table is empty', () => {
+    // 空词表拼成的 new RegExp('') 会匹配一切:那会让每一次快照都判失败、判忙。
+    const snapshot = pageWith('无关对话', '<div>解析失败</div>', { login: [], fail: [], busy: [], blocked: [] })
+    expect(snapshot).toMatchObject({ failed: '', failedElsewhere: '', blocked: '', busy: false })
+  })
 
   it('sees a healthy composer', () => {
     expect(sane).toMatchObject({ hasInput: true, loggedIn: true, failed: '', busy: false })
@@ -56,7 +102,7 @@ describe('snapshot state detection', () => {
   it('still reports a real failure shown in the composer', () => {
     // 收缩范围不能把真故障一起丢掉:站点贴在输入区的提示仍然算失败。
     const snapshot = pageWith('无关对话', '<div>解析失败</div>')
-    expect(snapshot.failed).toBe('解析失败')
+    expect(snapshot.failed).toContain('解析失败')
     expect(snapshot.failedElsewhere).toBe('')
   })
 
@@ -64,7 +110,7 @@ describe('snapshot state detection', () => {
     // 漏报的唯一线索:判据仍是空,但超时报错会带上这段文本。
     const snapshot = pageWith('助手：这里写了 解析失败 两个字')
     expect(snapshot.failed).toBe('')
-    expect(snapshot.failedElsewhere).toBe('解析失败')
+    expect(snapshot.failedElsewhere).toContain('解析失败')
   })
 
   it('still reports a real busy state shown in the composer', () => {

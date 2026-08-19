@@ -472,9 +472,11 @@
       ]
     },
     "packages/llm/llm-deepseek-web": {
+      "ignoreBinaries": [
+        "dsh"
+      ],
       "entry": [
-        "tests/**/*.spec.ts",
-        "tests/**/*.e2e.ts"
+        "tests/**/*.spec.ts"
       ],
       "project": [
         "src/**/*.ts",

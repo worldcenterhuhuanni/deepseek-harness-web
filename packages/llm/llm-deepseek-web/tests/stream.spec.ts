@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { DsWebAdapter, UNPARSABLE_CALL_CODE } from '../src/adapter.ts'
+import { BLOCKED_PAGE_CODE, DsWebAdapter, UNPARSABLE_CALL_CODE } from '../src/adapter.ts'
 import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { BridgeError, type AskRequest, type BridgeEvent, type WebSession } from '../src/session.ts'
@@ -76,7 +76,7 @@ describe('recovering an open web conversation after a failure', () => {
   /** A session whose *next* turn can be told to fail, before or after submitting. */
   function scripted() {
     const seen: AskRequest[] = []
-    let mode: 'ok' | 'fail-before-submit' | 'fail-after-submit' = 'ok'
+    let mode: 'ok' | 'fail-before-submit' | 'fail-after-submit' | 'fail-page-blocked' = 'ok'
     const session = {
       ask(request: AskRequest): AsyncGenerator<BridgeEvent> {
         seen.push(request)
@@ -85,6 +85,9 @@ describe('recovering an open web conversation after a failure', () => {
         mode = 'ok'
         return (async function* () {
           if (turn === 'fail-before-submit') throw new BridgeError('连接中断。', 'transport')
+          if (turn === 'fail-page-blocked') {
+            throw new BridgeError('无法发送消息：DeepSeek 提示「请删除异常文件再发送」。', 'page-blocked')
+          }
           if (turn === 'fail-after-submit') {
             yield { kind: 'submitted' }
             throw new BridgeError('连接中断。', 'transport')
@@ -93,11 +96,17 @@ describe('recovering an open web conversation after a failure', () => {
         })()
       },
     } as unknown as WebSession
-    return { session, seen, fail: (how: 'fail-before-submit' | 'fail-after-submit') => { mode = how } }
+    return {
+      session,
+      seen,
+      fail: (how: 'fail-before-submit' | 'fail-after-submit' | 'fail-page-blocked') => { mode = how },
+    }
   }
 
   /** Open a conversation, fail one turn the given way, then see if the next turn continues it. */
-  async function continuesAfter(how: 'fail-before-submit' | 'fail-after-submit'): Promise<boolean> {
+  async function continuesAfter(
+    how: 'fail-before-submit' | 'fail-after-submit' | 'fail-page-blocked',
+  ): Promise<boolean> {
     const { session, seen, fail } = scripted()
     const adapter = new DsWebAdapter({ session, useAttachment: () => false })
     await collect(adapter, turn(1))
@@ -111,6 +120,12 @@ describe('recovering an open web conversation after a failure', () => {
   it('keeps the conversation when the prompt never reached the page', async () => {
     // 登录过期、附件没挂上都发生在提交之前:页面没见过这一轮,不必白白重开一个对话。
     expect(await continuesAfter('fail-before-submit')).toBe(true)
+  })
+
+  it('drops the tab when the site refuses to send, though the content baseline still holds', async () => {
+    // 内容维度与通道维度相互独立:这一轮同样发生在提交之前,内容基线一个字没变,
+    // 但那个页面已经发不出消息 —— 只看内容维度就会一直复用它,每次重试再堆一张残留。
+    expect(await continuesAfter('fail-page-blocked')).toBe(false)
   })
 
   it('drops the conversation once the prompt was submitted', async () => {
@@ -281,14 +296,26 @@ describe('providerRetryPolicy', () => {
     const adapter = new DsWebAdapter({ session: replaying([]), retryPolicy: () => normal })
     const policy = adapter.providerRetryPolicy('deepseek-web')
     expect(policy).toMatchObject({ mode: 'normal', maxRetries: 2 })
-    expect(policy?.mode === 'normal' && policy.retryableCodes).toEqual(['RATE_LIMIT', UNPARSABLE_CALL_CODE])
+    expect(policy?.mode === 'normal' && policy.retryableCodes)
+      .toEqual(['RATE_LIMIT', UNPARSABLE_CALL_CODE, BLOCKED_PAGE_CODE])
   })
 
-  it('leaves the policy alone when the deployment opts out', () => {
+  it('adds only the code whose switch is on', () => {
     const adapter = new DsWebAdapter({
       session: replaying([]),
       retryPolicy: () => normal,
       retryOnUnparsableCall: () => false,
+    })
+    const policy = adapter.providerRetryPolicy('deepseek-web')
+    expect(policy?.mode === 'normal' && policy.retryableCodes).toEqual(['RATE_LIMIT', BLOCKED_PAGE_CODE])
+  })
+
+  it('leaves the policy alone when the deployment opts out of both', () => {
+    const adapter = new DsWebAdapter({
+      session: replaying([]),
+      retryPolicy: () => normal,
+      retryOnUnparsableCall: () => false,
+      retryOnBlockedPage: () => false,
     })
     expect(adapter.providerRetryPolicy('deepseek-web')).toBe(normal)
   })
