@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BridgeError, type WebSession } from './session.ts'
 import { parseToolCall, splitReply, visibleEnd, type SplitEvent } from './parse.ts'
-import { renderIncrement, renderRequest } from './render.ts'
+import { ATTACHMENT_NOTE, renderIncrement, renderRequest } from './render.ts'
 
 /** The tool names this request offers; gates recovery of unmarked calls. */
 function knownTools(options: GenerateOptions): ReadonlySet<string> {
@@ -71,8 +71,13 @@ export interface DsWebAdapterOptions {
   inlineLimit?: () => number
   /** Send the conversation as a `.md` attachment when it exceeds the inline limit. */
   useAttachment?: () => boolean
-  /** Where to report resume-vs-restart decisions; without it they are silent. */
-  log?: (message: string) => void
+  /**
+   * Where to report resume-vs-restart decisions and protocol violations;
+   * without it they are silent. `warn` marks a degraded turn — the model
+   * emitted a call in a form this route could not parse — which is the only
+   * health signal a text-protocol route has.
+   */
+  log?: (message: string, level?: 'info' | 'warn') => void
 }
 
 /** Map a bridge failure onto a provider-neutral dsh code. */
@@ -94,7 +99,7 @@ export class DsWebAdapter extends LlmAdapter {
   private readonly inlineLimit: () => number
   private readonly useAttachment: () => boolean
   private readonly displayName: string
-  private readonly log: ((message: string) => void) | undefined
+  private readonly log: ((message: string, level?: 'info' | 'warn') => void) | undefined
   /**
    * The web conversation currently open, or null when the next request must
    * start one. ponytail: 只跟一条;并发的 subagent 会让前缀校验落空,
@@ -165,8 +170,13 @@ export class DsWebAdapter extends LlmAdapter {
     )
     const rendered = resumeAt > 0 ? renderIncrement(options, resumeAt) : null
     const newChat = rendered === null
-    const { document, companionPrompt } = rendered ?? renderRequest(options)
-    const asAttachment = this.useAttachment() && document.length > this.inlineLimit()
+    const { history, preamble } = rendered ?? renderRequest(options)
+    // 只有对话正文改走附件。preamble 恒定留在输入框:页面只把输入框文本当指令,
+    // 所以尺寸判断决定的是传输方式,不能决定模型收到哪些指令。
+    const asAttachment = this.useAttachment() && history.length > this.inlineLimit()
+    const composer = asAttachment ? `${ATTACHMENT_NOTE}\n\n${preamble}` : `${history}\n\n---\n\n${preamble}`
+    // 计费按本轮实际送出的全部文本,附件内容也算。
+    const sentText = asAttachment ? `${composer}\n\n${history}` : composer
 
     let nextIndex = 0
     let open: OpenBlock | null = null
@@ -215,7 +225,7 @@ export class DsWebAdapter extends LlmAdapter {
       if (!parsed) {
         // 模型把格式跑飞了。退回成可见文本让人看得见,同时记一笔:这条路由的
         // 格式全靠模型配合,解析失败率是它唯一的健康指标,而回合会就此判成完成。
-        log?.(`工具调用解析失败，已退回文本：${raw.slice(0, 200)}`)
+        log?.(`工具调用解析失败，已退回文本：${raw.slice(0, 200)}`, 'warn')
         yield* emit('text', raw)
         return
       }
@@ -244,12 +254,12 @@ export class DsWebAdapter extends LlmAdapter {
     }
 
     // CDP 用本地文件路径挂载附件,所以上下文先落盘,离开本轮时删掉。
-    const attachment = asAttachment ? await writeContextFile(document) : undefined
+    const attachment = asAttachment ? await writeContextFile(history) : undefined
 
     try {
       // exactOptionalPropertyTypes:可选字段要么不出现,要么有值,不能显式传 undefined。
       const events = this.session.ask({
-        prompt: asAttachment ? companionPrompt : document,
+        prompt: composer,
         newChat,
         ...(isolated ? { isolated: true } : {}),
         ...(attachment ? { filePath: attachment.path } : {}),
@@ -257,8 +267,13 @@ export class DsWebAdapter extends LlmAdapter {
       })
 
       for await (const event of events) {
-        // progress 是「正在上传/正在解析」这类链路状态,不是模型输出,不进 chunk 流。
-        if (event.kind === 'progress') continue
+        // progress 是「正在上传/正在解析」这类链路状态,不是模型输出,所以不进 chunk 流
+        // (那条通路的内容都要能从 session log 重建),但也不能丢:挂附件最长等两分钟,
+        // 期间没有任何反馈。路由到 logger,与 diagnostic 同一条出口。
+        if (event.kind === 'progress') {
+          this.log?.(event.text)
+          continue
+        }
 
         if (event.kind === 'thinking') {
           yield* emit('reasoning', event.text)
@@ -315,7 +330,7 @@ export class DsWebAdapter extends LlmAdapter {
           : null
       }
 
-      yield { type: 'usage', usage: turnUsage(document, reply, totals) }
+      yield { type: 'usage', usage: turnUsage(sentText, reply, totals) }
       yield { type: 'finish', reason: state.sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' } }
     } catch (error) {
       // 未闭合的块必须先收口,否则 finish 会违反流语法校验。

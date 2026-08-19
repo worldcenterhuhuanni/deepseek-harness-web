@@ -1,9 +1,20 @@
 /**
- * Render one fully-assembled dsh request into the single Markdown document the
- * web composer receives.
+ * Render one fully-assembled dsh request into what the web composer receives.
  *
- * Every request is stateless: dsh owns the conversation, so the whole history
- * is re-sent each turn and the web session never carries state between turns.
+ * dsh owns the conversation; the page's memory of earlier turns is a cache, not
+ * the authority. So a request is split by ROLE, never by transport:
+ *
+ * - `preamble` is what the page must be *instructed* with on every turn. The
+ *   page treats only composer text as an instruction, so this half can never
+ *   move into an attachment, and an opening turn and a follow-up must produce
+ *   the same one — otherwise resuming a conversation silently weakens it.
+ * - `history` is conversation body. It may ride inline or as an attachment;
+ *   that choice belongs to the adapter and must not change what the model is
+ *   told.
+ *
+ * Splitting by transport is what previously dropped the tool protocol from
+ * every follow-up: the protocol lived in the attachment-only half, while short
+ * increments never reached the attachment threshold.
  *
  * @module @deepseek-ai/dsh-llm-deepseek-web/render
  */
@@ -14,12 +25,10 @@ import { TOOL_CALL_CLOSE, TOOL_CALL_OPEN } from './parse.ts'
 /**
  * The closing instruction, shared by the opening turn and every follow-up.
  *
- * It must not say "output only the reply itself". The tool protocol sits far
- * away — at the top of the opening turn, which usually rides as an attachment —
- * while this instruction sits right after the question, and the near instruction
- * wins: "only the reply itself" reads as an instruction *against* emitting a
- * tool-call marker, so the model describes what it would do instead of doing it.
- * The fix is to stop contradicting the protocol here, not to repeat the protocol.
+ * It must not say "output only the reply itself": the near instruction outranks
+ * the far one, so that phrasing reads as an instruction *against* emitting a
+ * tool-call marker, and the model describes what it would do instead of doing
+ * it.
  */
 const TASK_INSTRUCTION = [
   '## 你的任务',
@@ -32,11 +41,10 @@ const TASK_INSTRUCTION = [
 /**
  * The tool-call protocol, verbatim — the one text every surface repeats.
  *
- * It rides in the composer, not only in the attachment. An attachment is read
- * as a document: the model takes the tool *catalog* from it (it names tools it
- * could only have read there) while treating the *format* rule as prose it may
- * paraphrase, and a paraphrased call is an unparseable one. The composer text
- * is the only part of a request the page treats as an instruction.
+ * It belongs to {@link RenderedRequest.preamble} because an attachment is read
+ * as a document: the model takes the tool *catalog* from a document (it names
+ * tools it could only have read there) while treating a *format* rule as prose
+ * it may paraphrase, and a paraphrased call is an unparseable one.
  *
  * The JSON sits in a fenced block because the page renders markdown before we
  * read it back: outside a fence, `\"` renders as `"` and every call carrying a
@@ -55,6 +63,9 @@ const TOOL_CALL_PROTOCOL = [
   '- JSON 必须放在 ```json 代码块里，否则参数里的引号会在渲染时损坏',
   '- 一次可以连续输出多段工具调用',
 ].join('\n')
+
+/** Composer lead-in when the history rides as a file instead of inline. */
+export const ATTACHMENT_NOTE = '请阅读附件中的对话记录，然后按下面的要求作答。'
 
 /** Render the blocks of one message; unknown block types degrade to a labeled placeholder. */
 function renderBlocks(blocks: readonly ContentBlock[]): string {
@@ -111,28 +122,31 @@ function renderMessage(message: Message, index: number): string {
   return `### [${index + 1}] ${role}\n\n${renderBlocks(message.content)}`
 }
 
+/**
+ * The tool catalog: names, descriptions, and argument schemas.
+ *
+ * Body, not instruction — the model reads a catalog out of a document reliably,
+ * so this may ride as an attachment. The call *format* does not; it lives in
+ * {@link TOOL_CALL_PROTOCOL} and is stated once, in the preamble.
+ */
 function renderTools(tools: readonly ToolSchema[]): string {
   const catalog = tools
     .map(tool => `- \`${tool.name}\`：${tool.description}\n  参数 JSON Schema：\n  \`\`\`json\n  ${JSON.stringify(tool.parameters)}\n  \`\`\``)
     .join('\n')
 
-  return [
-    '## 可用工具',
-    '',
-    catalog,
-    '',
-    '## 工具调用格式（严格遵守）',
-    '',
-    TOOL_CALL_PROTOCOL,
-  ].join('\n')
+  return ['## 可用工具', '', catalog].join('\n')
 }
 
-/** The rendered request, split into what goes in the composer vs. the attachment. */
+/** One request, split by content role. */
 export interface RenderedRequest {
-  /** Full Markdown document — used as the attachment body, or as composer text when short. */
-  document: string
-  /** Short instruction shown in the composer when the document rides as a file. */
-  companionPrompt: string
+  /**
+   * What must reach the composer every turn: the live question, the task
+   * instruction, and the call protocol. Identical for an opening turn and a
+   * follow-up, which is what makes conversation resumption semantics-preserving.
+   */
+  preamble: string
+  /** Conversation body — inline or attached, the adapter's choice. */
+  history: string
 }
 
 /**
@@ -151,15 +165,34 @@ function lastUserQuestion(messages: readonly Message[]): Message | undefined {
 }
 
 /**
+ * The instruction half, identical on every turn of a conversation.
+ *
+ * The question is restated here rather than left to the history because one
+ * turn spans many steps: from the second step on, the history increment holds
+ * only tool output, and a question that is no longer in front of the model gets
+ * answered loosely (listing entries when asked to count them).
+ *
+ * @param options - the request whose question and task this describes.
+ * @returns composer-bound text.
+ */
+function buildPreamble(options: GenerateOptions): string {
+  const sections: string[] = []
+  const question = lastUserQuestion(options.messages)
+  if (question) sections.push(`## 当前要回答的问题\n\n${renderBlocks(question.content)}`)
+  sections.push(TASK_INSTRUCTION, TOOL_CALL_PROTOCOL)
+  return sections.join('\n\n---\n\n')
+}
+
+/**
  * Render only the turns the web conversation has not seen yet.
  *
- * The page keeps its own history, so a follow-up carries just the new user
- * turns and tool results — assistant turns are skipped because the page
- * produced them itself and already has them.
+ * Assistant turns are skipped: the page produced them and already holds them.
+ * The catalog is not re-sent either — the opening turn gave it in this same web
+ * conversation, and `resumeBlocker` guarantees the tool set has not changed.
  *
  * @param options - the full request; only the tail past `fromIndex` is used.
  * @param fromIndex - how many leading messages the page already holds.
- * @returns the incremental document, or null when nothing new needs sending.
+ * @returns the incremental request, or null when nothing new needs sending.
  */
 export function renderIncrement(
   options: GenerateOptions,
@@ -167,45 +200,24 @@ export function renderIncrement(
 ): RenderedRequest | null {
   const fresh = options.messages.slice(fromIndex).filter(message => message.role !== 'assistant')
   if (!fresh.length) return null
-
-  // 工具目录与调用格式不重发:首轮已在同一个网页对话里给过,而 resumeBlocker 保证
-  // 工具集未变,所以那份说明依然有效。续轮要做的只是别再用措辞把它压掉。
-  const sections = [fresh.map((message, i) => renderMessage(message, fromIndex + i)).join('\n\n')]
-
-  // 当前这一轮的提问必须在每个 step 都在场:一轮里的多个 step 共享同一个提问,
-  // 它在本轮结束前不是历史。而增量的边界是「已发送的消息条数」,提问在第一个 step
-  // 就发出去了,于是从第二个 step 起被切在边界外 —— 模型拿着工具输出自由发挥,
-  // 漏掉提问里的具体要求(问「有几个」时只列举、不报数)。
-  //
-  // 只补提问,不按「轮」重画边界:那样会把本轮之前所有 step 的工具结果一起重发
-  // (一轮五次工具调用,第五步要重发前四次的输出),而缺的只有提问这一条。
-  const carriesResult = fresh.some(message => message.content.some(block => block.type === 'tool-result'))
-  if (carriesResult) {
-    const question = lastUserQuestion(options.messages.slice(0, fromIndex))
-    if (question) sections.push(`## 当前要回答的问题\n\n${renderBlocks(question.content)}`)
-  }
-
-  sections.push(TASK_INSTRUCTION)
-
   return {
-    document: sections.join('\n\n---\n\n'),
-    companionPrompt: `请阅读附件中的新增内容，继续以助手身份作答。\n\n${TOOL_CALL_PROTOCOL}`,
+    history: fresh.map((message, i) => renderMessage(message, fromIndex + i)).join('\n\n'),
+    preamble: buildPreamble(options),
   }
 }
 
+/**
+ * Render a full request for a web conversation that holds nothing yet.
+ *
+ * @param options - the request to render.
+ * @returns the opening request; its preamble equals a follow-up's.
+ */
 export function renderRequest(options: GenerateOptions): RenderedRequest {
   const sections: string[] = []
 
   if (options.system) sections.push(`## 系统指令\n\n${options.system}`)
   if (options.tools?.length) sections.push(renderTools(options.tools))
+  sections.push(`## 对话记录\n\n${options.messages.map((m, i) => renderMessage(m, i)).join('\n\n')}`)
 
-  sections.push(
-    `## 对话记录\n\n${options.messages.map((m, i) => renderMessage(m, i)).join('\n\n')}`,
-  )
-  sections.push(TASK_INSTRUCTION)
-
-  return {
-    document: sections.join('\n\n---\n\n'),
-    companionPrompt: `请阅读附件中的对话记录，按其中「你的任务」一节作答。\n\n${TOOL_CALL_PROTOCOL}`,
-  }
+  return { history: sections.join('\n\n---\n\n'), preamble: buildPreamble(options) }
 }

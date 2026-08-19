@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "mode": "ask",
+  "auto_fix": ["comment", "duplicate", "orphan_test"],
+  "gate": "off-theme",
+  "oversize_lines": 300
+}

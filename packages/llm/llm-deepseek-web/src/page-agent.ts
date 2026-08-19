@@ -15,8 +15,17 @@
 export interface PageSnapshot {
   loggedIn: boolean
   hasInput: boolean
-  /** Page text matched an upload/parse failure hint. */
+  /** Composer text matched an upload/parse failure hint. */
   failed: string
+  /**
+   * A failure hint found OUTSIDE the composer, when none was found inside it.
+   *
+   * Never a failure verdict: the transcript is page text too, so a task that
+   * merely discusses 「解析失败」 would match forever. Reported only when the
+   * attach wait times out, where it is the sole clue that the site put a real
+   * notice somewhere this scope does not reach.
+   */
+  failedElsewhere: string
   /** An attachment is still uploading or parsing. */
   busy: boolean
 }
@@ -165,13 +174,21 @@ export const PAGE_AGENT = String.raw`
     },
 
     snapshot() {
-      const body = (document.body && document.body.innerText) || '';
-      const failMatch = body.match(FAIL_HINT);
+      // 状态只在输入区里找。FAIL_HINT/BUSY_HINT 命中的是站点贴在附件卡片与输入区
+      // 的提示,而 document.body.innerText 含整段对话历史 —— 一旦对话本身谈到
+      // 「解析失败」「处理中」这类词,内容就会被读成状态,而且历史不会消失,于是
+      // 从那一轮起每轮都失败:附件判失败(报错文本其实来自对话),或永久 busy 等到超时。
+      const box = composerBox();
+      const text = (box && box.innerText) || '';
+      const failMatch = text.match(FAIL_HINT);
+      const whole = (document.body && document.body.innerText) || '';
+      const outside = failMatch ? null : whole.match(FAIL_HINT);
       return {
         loggedIn: isLoggedIn(),
         hasInput: Boolean(findInput()),
         failed: failMatch ? failMatch[0] : '',
-        busy: BUSY_HINT.test(body),
+        failedElsewhere: outside ? outside[0] : '',
+        busy: BUSY_HINT.test(text),
       };
     },
 

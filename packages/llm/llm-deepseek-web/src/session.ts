@@ -353,7 +353,16 @@ export class WebSession {
         yield { kind: 'progress', text: '附件已就绪。' }
         return
       }
-      if (Date.now() > deadline) throw new BridgeError('等待 DeepSeek 解析附件超时。', 'transport')
+      if (Date.now() > deadline) {
+        // 输入区之外的命中不作判据(对话内容会碰撞),但超时是它唯一有用的时刻:
+        // 站点若把提示贴在这个范围之外,这句话是看出漏报的唯一线索。
+        throw new BridgeError(
+          snapshot.failedElsewhere
+            ? `等待 DeepSeek 解析附件超时；页面别处出现「${snapshot.failedElsewhere}」，但不在输入区内，未据此判失败。`
+            : '等待 DeepSeek 解析附件超时。',
+          'transport',
+        )
+      }
       await sleep(POLL_INTERVAL_MS, signal)
     }
   }

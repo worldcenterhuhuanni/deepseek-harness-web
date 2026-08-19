@@ -100,8 +100,10 @@ export function apply(ctx: Context, config: Config): void {
     inlineLimit: () => current().inlineLimit,
     useAttachment: () => current().useAttachment,
     // 网页那边意外多出一堆独立对话时,这条日志是唯一能说清为什么的东西。
-    log: (message) => {
-      ctx.logger.info(`llm-deepseek-web: ${message}`)
+    log: (message, level) => {
+      const line = `llm-deepseek-web: ${message}`
+      if (level === 'warn') ctx.logger.warn(line)
+      else ctx.logger.info(line)
     },
   })
 

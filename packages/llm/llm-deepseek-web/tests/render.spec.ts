@@ -1,16 +1,21 @@
 /**
  * What the composer actually receives.
  *
- * The regression that motivated these: a follow-up turn closed with "output only
- * the reply itself", which sits right after the question and therefore outranks
- * the tool protocol at the top of the opening turn — so the model narrated its
- * intent ("let me look at that directory") and never emitted a call, and dsh saw
- * a plain stop. Removing that contradiction was not enough: a run whose whole
- * request rode as an attachment answered with `[调用 glob] {"pattern": …}`,
- * naming a tool it could only have read from the attached catalog while
- * inventing its own call syntax. The page reads an attachment as a document and
- * only the composer text as an instruction, so the protocol now rides in the
- * composer on every turn — opening and follow-up alike.
+ * The regressions that motivated these, in order. A follow-up closed with
+ * "output only the reply itself", which sits nearer the question than the
+ * protocol and therefore outranked it — the model narrated its intent and dsh
+ * saw a plain stop. Removing that contradiction was not enough: a request that
+ * rode as an attachment answered with `[调用 glob] {…}`, naming a tool it could
+ * only have read from the attached catalog while inventing its own syntax,
+ * because the page reads an attachment as a document and only composer text as
+ * an instruction. The protocol then moved into a composer-bound half — but that
+ * half was selected by TRANSPORT, and a short follow-up never reached the
+ * attachment threshold, so from the second turn on the protocol reached the
+ * model on no path at all.
+ *
+ * Hence the split is now by ROLE, and the load-bearing assertion is that an
+ * opening turn and a follow-up produce the SAME preamble: resuming a web
+ * conversation must not silently weaken the instructions.
  *
  * @module @deepseek-ai/dsh-llm-deepseek-web/tests/render
  */
@@ -39,44 +44,65 @@ function options(overrides: Record<string, unknown> = {}) {
 }
 
 describe('renderRequest', () => {
-  it('carries the tool catalog with schemas and the call syntax', () => {
-    const { document } = renderRequest(options({ tools: TOOLS }))
-    expect(document).toContain('list_dir')
-    expect(document).toContain('JSON Schema')
-    expect(document).toContain(TOOL_CALL_OPEN)
+  it('carries the tool catalog with schemas in the history half', () => {
+    const { history } = renderRequest(options({ tools: TOOLS }))
+    expect(history).toContain('list_dir')
+    expect(history).toContain('JSON Schema')
   })
 
   it('never tells the model to output only the reply itself', () => {
-    const { document } = renderRequest(options({ tools: TOOLS }))
-    expect(document).not.toContain('只输出回复本身')
-    expect(document).toContain('不要只说明你打算做什么')
+    const { preamble } = renderRequest(options({ tools: TOOLS }))
+    expect(preamble).not.toContain('只输出回复本身')
+    expect(preamble).toContain('不要只说明你打算做什么')
   })
 })
 
 describe('renderIncrement', () => {
-  it('never contradicts the tool protocol', () => {
-    const rendered = renderIncrement(options({ tools: TOOLS }), 2)
-    expect(rendered).not.toBeNull()
-    expect(rendered?.document).not.toContain('只输出回复本身')
-    expect(rendered?.document).toContain('不要只说明你打算做什么')
+  it('sends only the new non-assistant turns', () => {
+    const { history } = renderIncrement(options({ tools: TOOLS }), 2) ?? { history: '' }
+    expect(history).toContain('第二个问题')
+    expect(history).not.toContain('第一个问题')
+    expect(history).not.toContain('第一个回答')
   })
 
   it('does not re-send the catalog or the schemas', () => {
-    const rendered = renderIncrement(options({ tools: TOOLS }), 2)
     // 首轮已在同一个网页对话里给过,且 resumeBlocker 保证工具集未变。
-    expect(rendered?.document).not.toContain('JSON Schema')
-    expect(rendered?.document).not.toContain('list_dir')
+    const { history } = renderIncrement(options({ tools: TOOLS }), 2) ?? { history: '' }
+    expect(history).not.toContain('JSON Schema')
+    expect(history).not.toContain('list_dir')
   })
 
-  it('sends only the new non-assistant turns', () => {
-    const rendered = renderIncrement(options({ tools: TOOLS }), 2)
-    expect(rendered?.document).toContain('第二个问题')
-    expect(rendered?.document).not.toContain('第一个问题')
-    expect(rendered?.document).not.toContain('第一个回答')
+  it('returns null when nothing new needs sending', () => {
+    expect(renderIncrement(options({ tools: TOOLS }), 3)).toBeNull()
+  })
+})
+
+describe('preamble equivalence', () => {
+  // 这条是承重断言:增量只是历史的传输优化,不允许削弱指令。协议、任务措辞、
+  // 当前提问一旦只出现在其中一条路径上,多轮之后模型就会失去格式约束,
+  // 输出退化成叙述,adapter 看不到调用便报 stop,任务静默中断。
+  it('is identical between an opening turn and a follow-up', () => {
+    const full = options({ tools: TOOLS })
+    expect(renderIncrement(full, 2)?.preamble).toBe(renderRequest(full).preamble)
   })
 
-  it('re-attaches the question on a tool-result turn', () => {
-    // 工具调用第二步:增量里只有工具结果,提问在第一步就发过了。
+  it('is identical with and without tools declared', () => {
+    expect(renderIncrement(options(), 2)?.preamble).toBe(renderIncrement(options({ tools: TOOLS }), 2)?.preamble)
+  })
+
+  it('states the call protocol verbatim, fenced', () => {
+    for (const preamble of [
+      renderRequest(options({ tools: TOOLS })).preamble,
+      renderIncrement(options({ tools: TOOLS }), 2)?.preamble ?? '',
+    ]) {
+      expect(preamble).toContain(TOOL_CALL_OPEN)
+      expect(preamble).toContain('```json')
+      expect(preamble).toContain('{"name": "工具名", "arguments": {…}}')
+    }
+  })
+
+  it('restates the live question on a tool-result step', () => {
+    // 一轮的第二个 step:增量里只有工具结果,提问在第一个 step 就发过了。
     const withResult = options({
       messages: [
         { id: 'm1', role: 'user', content: [{ type: 'text', text: '那个目录下有几个文件夹' }] },
@@ -86,43 +112,16 @@ describe('renderIncrement', () => {
       tools: TOOLS,
     })
     const rendered = renderIncrement(withResult, 1)
-    expect(rendered?.document).toContain('当前要回答的问题')
-    expect(rendered?.document).toContain('那个目录下有几个文件夹')
-    expect(rendered?.document).toContain('a\nb\nc')
-  })
-
-  it('does not re-attach the question when the turn already carries one', () => {
-    const rendered = renderIncrement(options({ tools: TOOLS }), 2)
-    expect(rendered?.document).not.toContain('当前要回答的问题')
-  })
-
-  it('keeps the same closing instruction with or without tools', () => {
-    const withTools = renderIncrement(options({ tools: TOOLS }), 2)
-    const without = renderIncrement(options(), 2)
-    expect(without?.document).toContain(TOOL_CALL_OPEN)
-    expect(without?.document).toBe(withTools?.document)
-  })
-
-  it('returns null when nothing new needs sending', () => {
-    expect(renderIncrement(options({ tools: TOOLS }), 3)).toBeNull()
+    expect(rendered?.preamble).toContain('当前要回答的问题')
+    expect(rendered?.preamble).toContain('那个目录下有几个文件夹')
+    expect(rendered?.history).toContain('a\nb\nc')
   })
 })
 
-describe('composer-borne tool protocol', () => {
-  it('states the protocol in the composer, not only in the attachment', () => {
-    // 附件里的格式约定会被当成可以转述的说明文字,而转述过的调用解析不了。
-    const opening = renderRequest(options({ tools: TOOLS }))
-    expect(opening.companionPrompt).toContain(TOOL_CALL_OPEN)
-    expect(opening.companionPrompt).toContain('```json')
-
-    const followup = renderIncrement(options({ tools: TOOLS }), 2)
-    expect(followup?.companionPrompt).toContain(TOOL_CALL_OPEN)
-    expect(followup?.companionPrompt).toContain('```json')
-  })
-
+describe('history rendering', () => {
   it('replays historical calls in the fenced form the protocol asks for', () => {
     // 模型会模仿历史里见过的写法;历史用裸 JSON 就等于示范了一种会被渲染破坏的格式。
-    const { document } = renderRequest(options({
+    const { history } = renderRequest(options({
       tools: TOOLS,
       messages: [
         { id: 'm1', role: 'user', content: [{ type: 'text', text: '看看' }] },
@@ -133,6 +132,6 @@ describe('composer-borne tool protocol', () => {
         },
       ],
     }))
-    expect(document).toContain('```json\n{"id":"c1","name":"read_file"')
+    expect(history).toContain('```json\n{"id":"c1","name":"read_file"')
   })
 })

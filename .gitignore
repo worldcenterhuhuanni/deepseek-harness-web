@@ -38,3 +38,11 @@ apps/web/dist/
 worktrees/
 .agents/worktrees/
 .typert-*/
+
+# ITP 本地产物（config.json 需要提交；dialogue.jsonl 含对话原文，勿提交）
+.itp/data/
+.itp/index.html
+.itp/state.json
+.itp/dialogue.jsonl
+.itp/decisions.jsonl
+.itp/confirmations.jsonl
