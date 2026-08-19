@@ -12,6 +12,8 @@
  * @module @deepseek-ai/dsh-llm-deepseek-web/parse
  */
 
+import { jsonrepair } from 'jsonrepair'
+
 export const TOOL_CALL_OPEN = '<tool_call>'
 export const TOOL_CALL_CLOSE = '</tool_call>'
 
@@ -23,6 +25,15 @@ const NARRATED_PREFIX = '[调用'
 
 /** 开标签容忍属性与空白:模型常写成 `<tool_call name="read">`。 */
 const OPEN_RE = /<tool_call\b[^>]*>/gi
+
+/**
+ * 协议要求载荷放在 ```json 围栏里，所以围栏就是一个调用的边界。
+ * 末尾允许缺失闭合围栏：回复被截断时，最后一个块收不到 ``` 。
+ */
+const FENCE_RE = /```json[^\n]*\n([\s\S]*?)(?:\n```|$)/g
+
+/** 同一模式的非全局副本：用来在一段文本里定位第一个围栏，不触碰 FENCE_RE 的 lastIndex。 */
+const FENCE_ONE = /```json[^\n]*\n[\s\S]*?(?:\n```|$)/
 const CLOSE_RE = /<\/tool_call\s*>/i
 
 export type SplitEvent =
@@ -93,6 +104,41 @@ function jsonObjectEnd(text: string, open: number): number {
 }
 
 /**
+ * 修一次模型写坏的载荷；无从修复时返回 null。
+ *
+ * 它之所以安全，一是围栏已经把边界圈定在一个调用之内，二是修完仍须通过三道闸门：
+ * 能解析、带 `name`、且 `name` 是本轮提供的工具。除了长 `arguments` 末尾漏掉的
+ * 右括号，它还能救回被截断的字符串，以及模型惯用的单引号／尾逗号写法。修出来的
+ * `arguments` 可能不完整，那时工具执行层会拒绝它，模型据此改正——这比让回合悄悄
+ * 自称完成要好。
+ * @param json - 围栏内的原始载荷文本。
+ * @returns 修复后的 JSON 文本；jsonrepair 认为无从修复时返回 null。
+ */
+function repairPayload(json: string): string | null {
+  try {
+    return jsonrepair(json)
+  } catch {
+    // JSONRepairError：输入无从修复（散文、半个键名）。它不是调用，交给调用方按文本处理。
+    return null
+  }
+}
+
+/**
+ * 解析一段载荷，原样解析不出来就修一次再试。
+ *
+ * 两条恢复路径共用它，所以带标记的调用和裸围栏得到同样的待遇——模型漏掉最外层
+ * 括号这件事，跟它有没有写标记无关。
+ * @param payload - 来自标记躯体或围栏的载荷文本。
+ * @returns 调用；修完仍然得不到调用时返回 null。
+ */
+function parseOrRepair(payload: string): ParsedToolCall | null {
+  const direct = parseToolCall(payload)
+  if (direct !== null) return direct
+  const repaired = repairPayload(payload)
+  return repaired === null ? null : parseToolCall(repaired)
+}
+
+/**
  * `[调用 read] {…}` — how the web model announces a call when it ignores the
  * protocol. The site's own system prompt outranks anything the composer says,
  * and this is the form it produces instead; the JSON that follows is the
@@ -101,12 +147,11 @@ function jsonObjectEnd(text: string, open: number): number {
 const NARRATED_CALL_RE = /\[调用\s+([A-Za-z0-9_.-]+)\]\s*$/
 
 /**
- * Recover calls the model emitted without the agreed marker, in either form it
- * actually uses: the narrated `[调用 name] {args}`, or a bare
- * `{"name":…,"arguments":…}` object. Both are restricted to `knownTools`, so
- * ordinary JSON in a reply is never mistaken for a call.
+ * 恢复围栏之外的调用，覆盖模型实际用的两种写法：叙述式 `[调用 name] {args}`，
+ * 以及裸的 `{"name":…,"arguments":…}` 对象。两者都以 `knownTools` 为闸门，所以
+ * 回复里普通的 JSON 不会被误当成调用。
  */
-function* recoverUnmarkedCalls(text: string, knownTools: ReadonlySet<string>): Generator<SplitEvent> {
+function* recoverBareCalls(text: string, knownTools: ReadonlySet<string>): Generator<SplitEvent> {
   // emitted 是尚未交出的正文起点,scan 是下一个候选的搜索起点;
   // 合成一个游标会让被否决的候选连同它前面的正文一起消失。
   let emitted = 0
@@ -143,6 +188,31 @@ function* recoverUnmarkedCalls(text: string, knownTools: ReadonlySet<string>): G
 }
 
 /**
+ * 先恢复围栏里的调用，再退回到无围栏的写法。
+ *
+ * 围栏正是协议要求的载荷边界，所以每一块各自独立解析。跨整段回复数括号做不到这
+ * 件事：只要一块漏了最后的 `}`，它后面的每一块都会被吞进来，整段退化成可见文本
+ * ——而循环会把那读成一个已完成的回合。
+ * @param text - 已经不含 `<tool_call>` 标记的回复文本。
+ * @param knownTools - 本轮提供的工具名。
+ * @returns 按回复顺序排列的可见文本与调用躯体。
+ */
+function* recoverUnmarkedCalls(text: string, knownTools: ReadonlySet<string>): Generator<SplitEvent> {
+  let emitted = 0
+  FENCE_RE.lastIndex = 0
+  for (let fence = FENCE_RE.exec(text); fence !== null; fence = FENCE_RE.exec(text)) {
+    const payload = fence[1] ?? ''
+    const parsed = parseOrRepair(payload)
+    if (!parsed || !knownTools.has(parsed.name)) continue
+    if (fence.index > emitted) yield* recoverBareCalls(text.slice(emitted, fence.index), knownTools)
+    yield { kind: 'tool-call', raw: JSON.stringify({ name: parsed.name, arguments: safeJson(parsed.arguments) }) }
+    emitted = fence.index + fence[0].length
+    FENCE_RE.lastIndex = emitted
+  }
+  if (emitted < text.length) yield* recoverBareCalls(text.slice(emitted), knownTools)
+}
+
+/**
  * Split a complete reply.
  * @param text - the final reply body.
  * @param knownTools - tool names offered this request; gates bare-JSON recovery.
@@ -156,11 +226,34 @@ export function splitReply(text: string, knownTools: ReadonlySet<string>): Split
     const bodyStart = open.index + open[0].length
     const rest = text.slice(bodyStart)
     const close = CLOSE_RE.exec(rest)
-    // 未闭合说明回复被截断了;把剩下的全当调用体,解析失败会退回可见文本。
-    const body = close === null ? rest : rest.slice(0, close.index)
+    // 缺闭合标记不等于回复被截断:模型常漏写 `</tool_call>` 而后面还有更多调用。
+    // 协议要求标记内是一个 ```json 围栏,所以边界止于该围栏的结束;吞掉剩余全文
+    // 会让后面每一个调用都消失 —— 一次 5 个调用只剩第一个,任务随即停在半路。
+    // 连围栏结束都没有才是真截断,那时保留「剩下全是调用体」。
+    const fence = close === null ? FENCE_ONE.exec(rest) : null
+    let body: string
+    let nextCursor: number
+    if (close !== null) {
+      body = rest.slice(0, close.index)
+      nextCursor = bodyStart + close.index + close[0].length
+    } else if (fence !== null) {
+      body = fence[0]
+      nextCursor = bodyStart + fence.index + fence[0].length
+    } else {
+      body = rest
+      nextCursor = text.length
+    }
     if (open.index > cursor) events.push(...recoverUnmarkedCalls(text.slice(cursor, open.index), knownTools))
-    events.push({ kind: 'tool-call', raw: body.trim() })
-    cursor = close === null ? text.length : bodyStart + close.index + close[0].length
+    // 带标记的调用不过 knownTools 闸门:标记本身已经是明确意图,未知工具名交给
+    // 执行层报错,模型据此改名重试。修不好则保留原文,由适配器退回可见文本。
+    const marked = parseOrRepair(body)
+    events.push({
+      kind: 'tool-call',
+      raw: marked === null
+        ? body.trim()
+        : JSON.stringify({ name: marked.name, arguments: safeJson(marked.arguments) }),
+    })
+    cursor = nextCursor
     OPEN_RE.lastIndex = cursor
   }
   if (cursor < text.length) events.push(...recoverUnmarkedCalls(text.slice(cursor), knownTools))
@@ -168,7 +261,7 @@ export function splitReply(text: string, knownTools: ReadonlySet<string>): Split
 }
 
 /** Everything a reply could use to open a tool call, marked or not. */
-const CALL_STARTS = [TOOL_CALL_OPEN_PREFIX, NARRATED_PREFIX, '{'] as const
+const CALL_STARTS = [TOOL_CALL_OPEN_PREFIX, NARRATED_PREFIX, '```json', '{'] as const
 
 /** How much of `text`'s tail could still grow into `marker`. */
 function heldSuffixLen(text: string, marker: string): number {

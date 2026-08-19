@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { DsWebAdapter } from '../src/adapter.ts'
+import { DsWebAdapter, UNPARSABLE_CALL_CODE } from '../src/adapter.ts'
 import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { BridgeError, type AskRequest, type BridgeEvent, type WebSession } from '../src/session.ts'
@@ -217,5 +217,83 @@ describe('tool-call identity', () => {
 
     const ids = await callIds(adapter, turn(1))
     expect(new Set(ids).size).toBe(2)
+  })
+})
+
+describe('unparsable call enters the harness error path', () => {
+  // 承重点:一个都没读懂却明显在尝试调用时,回合不能以 completed 收尾 —— 那正是
+  // 「它说要做，然后不动了」的来源。报 error 才能进 agent/request-error 与
+  // dsh-llm-retry,复用 harness 自己的反馈循环,而不是在这里再造一个重问机制。
+  // 带标记所以意图明确,但躯体里没有可用载荷 —— jsonrepair 也造不出对象。
+  // (缺括号那种反而修得回来,那时应该报 tool-calls,见下一条。)
+  const brokenCall = '我来看看。\n<tool_call>\nglob\n</tool_call>'
+
+  it('reports an error finish instead of stop', async () => {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of new DsWebAdapter({ session: replaying(deltas([brokenCall])) }).stream(request())) {
+      chunks.push(chunk)
+    }
+    const finish = chunks.find(c => c.type === 'finish')
+    expect(finish).toEqual({
+      type: 'finish',
+      reason: { kind: 'error', failure: { message: expect.any(String) as string, code: UNPARSABLE_CALL_CODE } },
+    })
+  })
+
+  it('still reports tool-calls when at least one call survived', async () => {
+    // 同轮里既有读懂的也有没读懂的:执行读懂的那些,别把整轮判成失败。
+    const mixed = [
+      '```json',
+      '{"name":"glob","arguments":{"pattern":"*.ts"}}',
+      '```',
+      '',
+      '```json',
+      '{"name":"read","arguments":{"file_path":',   // 连字符串都没开始,修不出来
+      '```',
+    ].join('\n')
+    const chunks: StreamChunk[] = []
+    for await (const chunk of new DsWebAdapter({ session: replaying(deltas([mixed])) }).stream(request())) {
+      chunks.push(chunk)
+    }
+    expect(chunks.find(c => c.type === 'finish')).toEqual({ type: 'finish', reason: { kind: 'tool-calls' } })
+  })
+
+  it('reports plain stop for a reply that never attempts a call', async () => {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of new DsWebAdapter({ session: replaying(deltas(['已经改好了。'])) }).stream(request())) {
+      chunks.push(chunk)
+    }
+    expect(chunks.find(c => c.type === 'finish')).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+  })
+})
+
+describe('providerRetryPolicy', () => {
+  const normal = Object.freeze({
+    mode: 'normal' as const,
+    maxRetries: 2,
+    retryableCodes: Object.freeze(['RATE_LIMIT']),
+    initialDelayMs: 1,
+    maxDelayMs: 2,
+    jitterRatio: 0,
+  })
+
+  it('extends the configured codes rather than replacing them', () => {
+    const adapter = new DsWebAdapter({ session: replaying([]), retryPolicy: () => normal })
+    const policy = adapter.providerRetryPolicy('deepseek-web')
+    expect(policy).toMatchObject({ mode: 'normal', maxRetries: 2 })
+    expect(policy?.mode === 'normal' && policy.retryableCodes).toEqual(['RATE_LIMIT', UNPARSABLE_CALL_CODE])
+  })
+
+  it('leaves the policy alone when the deployment opts out', () => {
+    const adapter = new DsWebAdapter({
+      session: replaying([]),
+      retryPolicy: () => normal,
+      retryOnUnparsableCall: () => false,
+    })
+    expect(adapter.providerRetryPolicy('deepseek-web')).toBe(normal)
+  })
+
+  it('falls back to seam defaults when no policy is injected', () => {
+    expect(new DsWebAdapter({ session: replaying([]) }).providerRetryPolicy('deepseek-web')).toBeUndefined()
   })
 })

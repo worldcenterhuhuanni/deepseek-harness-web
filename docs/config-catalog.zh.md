@@ -893,6 +893,45 @@ export interface DeepSeekCatalogModel {
 
 来源：[`packages/llm/llm-deepseek/src/index.ts:62`](../packages/llm/llm-deepseek/src/index.ts)
 
+<a id="deepseek-aidsh-llm-deepseek-web"></a>
+
+## `@deepseek-ai/dsh-llm-deepseek-web`
+
+需要：`llm`
+
+```ts config-catalog
+export interface Config {
+  /** 要驱动的 Chrome 调试端口地址。 */
+  endpoint: string
+  /** 端口无响应时，拉起一个带独立 profile 的 Chrome。 */
+  autoLaunch: boolean
+  /** 自动启动时使用的浏览器 profile 目录；留空表示 `$DSH_HOME/deepseek-web-profile`。 */
+  userDataDir: string
+  /** Chrome 可执行文件路径；留空表示自动探测，`CHROME_PATH` 环境变量同样生效。 */
+  chromePath: string
+  /** 对话正文超过该字符数时改走 `.md` 附件，而不是并进输入框文本。 */
+  inlineLimit: number
+  /** 是否允许走附件；关掉则一切内容都留在输入框里。 */
+  useAttachment: boolean
+  /** 页面可以多久没有任何动静，超过即判本轮失败。 */
+  idleTimeoutMs: number
+  /** 单轮的绝对上限，与页面是否有动静无关。 */
+  hardTimeoutMs: number
+  /** 是否开启站点的「深度思考」，它会显著拖长首字延迟。 */
+  deepThinking: boolean
+  /** 是否开启站点的「智能搜索」；站点默认是开的，每轮要多花数十秒。 */
+  webSearch: boolean
+  /** 随本 provider 路由一起捕获的重试策略；不填表示沿用 seam 默认。 */
+  retryPolicy?: RetryPolicyConfig
+  /** 工具调用解析不出时，按可重试失败处理，而不是当成一个已完成的回合。 */
+  retryOnUnparsableCall: boolean
+}
+```
+
+依赖：[`RetryPolicyConfig`](../packages/llm/llm/src/index.ts)
+
+来源：[`packages/llm/llm-deepseek-web/src/index.ts:48`](../packages/llm/llm-deepseek-web/src/index.ts)
+
 <a id="deepseek-aidsh-llm-pi-ai"></a>
 
 ## `@deepseek-ai/dsh-llm-pi-ai`

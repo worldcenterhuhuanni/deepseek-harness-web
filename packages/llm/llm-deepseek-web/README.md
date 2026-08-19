@@ -55,6 +55,8 @@
 | `chromePath` | 自动探测 | Chrome 可执行文件；也可用 `CHROME_PATH` 环境变量 |
 | `inlineLimit` | `4000` | 对话正文超过该字符数改用 `.md` 附件发送；不影响恒在输入框的 `preamble` |
 | `useAttachment` | `true` | 关掉则正文也一律走输入框；网页端拒收 `.md` 时用它兜底 |
+| `retryPolicy` | seam 默认 | 本路由的重试策略，与官方 `llm-deepseek` 同一套 schema |
+| `retryOnUnparsableCall` | `true` | 调用完全解析不出时按重试策略重发本轮，而不是把回合当成已完成 |
 | `idleTimeoutMs` | `180000` | 页面多久没动静判定失败 |
 | `hardTimeoutMs` | `600000` | 单轮绝对上限 |
 | `deepThinking` | `false` | 网页端「深度思考」，开启会显著拉长首字延迟 |
@@ -109,13 +111,22 @@
 
 解析不出调用时不静默丢弃：`agent-loop` 看到 0 个 tool-call block 就会把该回合判成完成、任务停在半路，所以退回成可见文本让人看得见发生了什么。
 
+**一个都没读懂时报 `error` 而不是 `stop`，交给 harness 自己的反馈循环。** 这条通路无法保证模型写出可解析的调用，所以真正管用的恢复手段不是再加一层修复启发式，而是复用 harness 已有的两条反馈通道：读懂了的调用照常发出去，参数不对由工具执行层报错、错误随 `tool-result` 进入下一轮，模型据此改正；一个都没读懂却明显在尝试调用时，回合以 `{ kind: 'error', code: UNPARSABLE_TOOL_CALL }` 结束，进入 `agent/request-error` 与其后的 [`dsh-llm-retry`](../llm-retry/README.md)，按该 provider 的重试策略重发本轮请求。适配器通过 `providerRetryPolicy()` 把 `UNPARSABLE_TOOL_CALL` 追加进配置里的 `retryableCodes`——追加而不是替换，部署自己的错误码、退避与次数上限仍然作准；`retryOnUnparsableCall: false` 可以退出这个行为。同轮里既有读懂的也有没读懂的时仍报 `tool-calls`，因为放弃已读懂的调用比重试更亏。
+
 **协议必须写进输入框，而且注意力仍不归我们。** 站点自己的系统提示词压过我们说的任何话：把格式约定只放在附件里时，模型会从附件读到工具目录（它能叫出只可能来自那里的工具名），却把格式规则当成可以转述的说明文字——实测输出过 `[调用 glob] {"pattern": …}` 这种自创写法。所以请求按**内容角色**切分，而不是按传输方式：`preamble`（本轮提问 + 任务要求 + `TOOL_CALL_PROTOCOL`）恒定进输入框，`history`（对话正文与工具目录）才允许改走附件。历史里的工具调用也按同一格式回放（模型会模仿它见过的写法）。即便如此也只是提高命中率，不是保证。
+
+**缺闭合标记不等于回复被截断。** 模型常写了 `<tool_call>` 却漏掉 `</tool_call>`，而后面还有更多调用。旧行为把开标签之后的**剩余全文**当成这一个调用的躯体，于是一轮里的 5 个调用只剩第一个被执行，其余连同围栏一起消失，任务停在半路。现在边界止于标记内第一个 ```json 围栏的结束；只有连围栏结束都找不到时才按真截断处理。带标记的调用不过工具集闸门——标记本身已是明确意图，未知工具名交给执行层报错，模型据此改名重试。
+
+**围栏就是调用的边界，每块独立解析。** 协议要求载荷放在 ```json 围栏里，所以解析先按围栏切块，块内再解 JSON。全局括号计数做不到这件事：模型在长 `arguments`（一次 `edit` 带两段代码）末尾漏掉最外层的 `}` 之后，计数会越过这个块继续数下一个块，depth 永不归零，两个调用一起退化成可见文本——而 `agent-loop` 看到 0 个 tool-call block 就把回合判成完成，任务静默停在半路。块内写坏的载荷交给 [`jsonrepair`](https://github.com/josdejong/jsonrepair) 修一次再重试：除了漏掉的右括号，它还能救回被截断的字符串与模型惯用的单引号／尾逗号写法，对无从修复的输入抛错。修复只在围栏这个已知边界内安全，且修完仍须 JSON 可解析、带 `name`、且 `name` 在本轮工具集内，三道闸门之后才认。修复后的 `arguments` 可能不完整，工具执行时会拒绝它，模型据此重试——这好过把回合静默判成完成。
 
 **因此解析器必须极度宽容。** 这不是防御式编程，是这条通路的固有条件——我们无法约束输出格式，只能识别模型实际使用的形式。目前认四种：
 
 | 形式 | 来源 |
 |---|---|
 | `<tool_call>` + `json` 代码块 | 协议规定的写法 |
+| 只有 ```json 围栏、没有 `<tool_call>` 标记 | 模型省掉标记但保留围栏（最常见） |
+| 围栏内缺最外层 `}` | 长 `arguments` 末尾漏括号，交 `jsonrepair` 修 |
+| 截断的字符串、单引号、尾逗号 | 同上，由 `jsonrepair` 覆盖 |
 | `<tool_call name="read">` 带属性、或缺闭标签 | 模型漏写、回复被截断 |
 | 裸 `{"name":…,"arguments":…}` | 模型完全没写标记 |
 | `[调用 read] {参数}` | 站点系统提示词压过协议时的自创写法 |
@@ -135,7 +146,9 @@
 | macOS / Linux | `launcher/launchMac.command` | 同文件 |
 | Windows | `launcher/launchWindow.cmd` | `launcher/launch.ps1` |
 
-`--rebuild` / `-Rebuild` 强制重建，`--self-test` / `-SelfTest` 只跑内部版本判断用例。端口从 3080 起自动避开已占用的端口。启动的是**本仓库源码**（`pnpm dsh web`），因此改完源码重启即生效。
+`--rebuild` / `-Rebuild` 强制重建，`--self-test` / `-SelfTest` 只跑内部版本判断用例。端口从 3080 起自动避开已占用的端口。
+
+**产物过期会自动重建，判据是时间戳而不是「文件是否存在」。** 这一点关乎正确性：dsh 主体由 tsx 直接跑 `src`，但本插件是以 `main: lib/index.js` 被 Node 从 profile 的 `node_modules` 加载的，所以改了 `src` 不重建，跑起来仍是旧代码——而启动过程一路显示成功，是最难查的一类问题。启动器因此比较 `packages/*/*/src` 与 `apps/*/src` 下任一 `.ts` 是否比 `apps/cli/lib/bin.js` 新（`find … -print -quit`，命中即停）；`tests/` 的改动不算，因为 tsdown 只打包 `src`。改完源码重启启动器即可，不必记得加 `--rebuild`。
 
 只走命令行、不双击时用这条，效果等同于「挂 profile + `pnpm dsh web`」，同样幂等（端口为默认 3080）：
 

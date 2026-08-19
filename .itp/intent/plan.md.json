@@ -1,0 +1,26 @@
+{
+  "itp_version": "1",
+  "change": "plan.md",
+  "theme": {
+    "text": "这次要做什么（一句话主题）",
+    "source": "document",
+    "ts": "2026-08-19T15:51:24+08:00",
+    "history": []
+  },
+  "requirements": [
+    {
+      "id": "R1",
+      "statement": "子目标",
+      "anchors": [],
+      "anchor_level": 0,
+      "scenarios": [],
+      "source": "document",
+      "status": "active",
+      "evidence": "",
+      "ts": "2026-08-19T15:51:24+08:00",
+      "confirmed": "unconfirmed",
+      "plan_ok": "unreviewed"
+    }
+  ],
+  "revisions": []
+}

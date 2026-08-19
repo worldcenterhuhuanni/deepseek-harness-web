@@ -19,6 +19,7 @@ import {
   type LlmModelInfo,
   type LlmProviderInfo,
   type LlmResolvedModelInfo,
+  type ResolvedRetryPolicy,
   type StreamChunk,
   type TokenUsage,
 } from '@deepseek-ai/dsh-llm'
@@ -42,6 +43,16 @@ function toolSignature(options: GenerateOptions): string {
 
 /** Beyond this many characters the request rides as an attachment. */
 export const DEFAULT_INLINE_LIMIT = 4_000
+
+/**
+ * 回复明显在尝试调用工具、但写成了这里读不懂的形态时使用的失败码。
+ *
+ * 它以 `error` 而不是 `stop` 结束本轮，让这一回合进入 harness 自己的错误路径
+ * （`agent/request-error`，以及它背后的 `dsh-llm-retry`），而不是被计成一个已完成
+ * 的回合。文本协议这条通路没法保证模型写出可解析的调用，所以真正管用的恢复手段
+ * 是 harness 已经实现的重试，而不是在这里再加一层修复启发式。
+ */
+export const UNPARSABLE_CALL_CODE = 'UNPARSABLE_TOOL_CALL'
 
 /** A content block currently accumulating deltas. */
 interface OpenBlock {
@@ -71,6 +82,10 @@ export interface DsWebAdapterOptions {
   inlineLimit?: () => number
   /** Send the conversation as a `.md` attachment when it exceeds the inline limit. */
   useAttachment?: () => boolean
+  /** 归本 provider 所有的重试策略；每次请求现读，改了设置下一次调用即生效。 */
+  retryPolicy?: () => ResolvedRetryPolicy
+  /** 解析不出的工具调用是否加入策略的可重试错误码。 */
+  retryOnUnparsableCall?: () => boolean
   /**
    * Where to report resume-vs-restart decisions and protocol violations;
    * without it they are silent. `warn` marks a degraded turn — the model
@@ -99,6 +114,8 @@ export class DsWebAdapter extends LlmAdapter {
   private readonly inlineLimit: () => number
   private readonly useAttachment: () => boolean
   private readonly displayName: string
+  private readonly retryPolicy: (() => ResolvedRetryPolicy) | undefined
+  private readonly retryOnUnparsableCall: () => boolean
   private readonly log: ((message: string, level?: 'info' | 'warn') => void) | undefined
   /**
    * The web conversation currently open, or null when the next request must
@@ -113,11 +130,31 @@ export class DsWebAdapter extends LlmAdapter {
     this.inlineLimit = options.inlineLimit ?? (() => DEFAULT_INLINE_LIMIT)
     this.useAttachment = options.useAttachment ?? (() => true)
     this.displayName = options.displayName ?? 'DeepSeek 网页（已登录）'
+    this.retryPolicy = options.retryPolicy
+    this.retryOnUnparsableCall = options.retryOnUnparsableCall ?? (() => true)
     this.log = options.log
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: this.displayName }
+  }
+
+  /**
+   * 配置里的策略，追加上「调用解析不出」这一种。
+   *
+   * 追加而不是替换，是为了让部署自己的错误码、退避与次数上限仍然作准；
+   * `retryOnUnparsableCall: false` 可以退出这个行为，而 `always` 策略本来就重试一切。
+   * @param _provider - 本适配器拥有的一条路由。
+   * @returns 随路由一起捕获的策略；返回 undefined 表示沿用 seam 默认。
+   */
+  override providerRetryPolicy(_provider: string): ResolvedRetryPolicy | undefined {
+    const policy = this.retryPolicy?.()
+    if (policy === undefined || !this.retryOnUnparsableCall()) return policy
+    if (policy.mode !== 'normal' || policy.retryableCodes.includes(UNPARSABLE_CALL_CODE)) return policy
+    return Object.freeze({
+      ...policy,
+      retryableCodes: Object.freeze([...policy.retryableCodes, UNPARSABLE_CALL_CODE]),
+    })
   }
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
@@ -190,7 +227,8 @@ export class DsWebAdapter extends LlmAdapter {
     // 内层 generator 拿不到 this,先取出来。
     const { log } = this
     // 放进对象里:它只在内层 generator 中被置真,写成局部 let 会被控制流分析判成恒假。
-    const state = { sawToolCall: false }
+    // 放进对象里的第二个原因:两个标记都只在内层 generator 里被置真。
+    const state = { sawToolCall: false, unparsableCall: false }
 
     // 关掉当前块并补上 block-end,保证 finish 时没有未闭合块。
     const closeOpen = function* (): Generator<StreamChunk> {
@@ -226,6 +264,7 @@ export class DsWebAdapter extends LlmAdapter {
         // 模型把格式跑飞了。退回成可见文本让人看得见,同时记一笔:这条路由的
         // 格式全靠模型配合,解析失败率是它唯一的健康指标,而回合会就此判成完成。
         log?.(`工具调用解析失败，已退回文本：${raw.slice(0, 200)}`, 'warn')
+        state.unparsableCall = true
         yield* emit('text', raw)
         return
       }
@@ -331,7 +370,19 @@ export class DsWebAdapter extends LlmAdapter {
       }
 
       yield { type: 'usage', usage: turnUsage(sentText, reply, totals) }
-      yield { type: 'finish', reason: state.sawToolCall ? { kind: 'tool-calls' } : { kind: 'stop' } }
+      // 有可用调用就交给工具循环 —— 同轮里那些没读懂的会留在正文里,模型下一轮看得见。
+      // 一个都没读懂却明显在尝试调用时报 error:那不是「答完了」,交给 harness 的
+      // 错误路径去重试,而不是让回合以 completed 收尾把任务丢在半路。
+      if (state.sawToolCall) yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      else if (state.unparsableCall) {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: { message: 'DeepSeek 网页返回的工具调用无法解析。', code: UNPARSABLE_CALL_CODE },
+          },
+        }
+      } else yield { type: 'finish', reason: { kind: 'stop' } }
     } catch (error) {
       // 未闭合的块必须先收口,否则 finish 会违反流语法校验。
       yield* closeOpen()

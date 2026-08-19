@@ -131,11 +131,28 @@ step 3 '安装仓库依赖（已是最新时几乎瞬间完成）'
 pnpm install || die 'pnpm install 失败'
 ok '依赖就绪'
 
+# 产物「存在」不等于「是最新的」:插件是以 main: lib/index.js 被 Node 加载的,
+# 改了 src 却不重建,跑起来仍是旧代码 —— 而进度里却显示成功,最难查。
+# 所以判据是时间戳:任一源文件比产物新就重建。find 命中即停,不扫全树。
+stale_sources() {
+  # 只看 src:tsdown 只打包它,测试文件改动不影响产物,拿它触发全量重建是白等几分钟。
+  find packages apps -name node_modules -prune \
+    -o -path '*/src/*' -name '*.ts' -newer apps/cli/lib/bin.js -print -quit 2>/dev/null
+}
+
 step 4 '构建'
-if [ "$rebuild" = 0 ] && [ -f apps/cli/lib/bin.js ] && [ -f apps/web/dist/index.html ]; then
-  ok '产物已存在，跳过（--rebuild 可强制重建）'
+if [ "$rebuild" = 1 ]; then
+  note '强制重建'
+elif [ ! -f apps/cli/lib/bin.js ] || [ ! -f apps/web/dist/index.html ]; then
+  note '尚无构建产物'
+elif [ -n "$(stale_sources)" ]; then
+  note "源码已改动（$(stale_sources) 等），产物过期，重新构建"
 else
-  note '首次构建需要数分钟'
+  ok '产物是最新的，跳过'
+  skip_build=1
+fi
+if [ "${skip_build:-0}" = 0 ]; then
+  note '全量构建需要数分钟'
   pnpm run build || die '构建失败'
   ok '构建完成'
 fi

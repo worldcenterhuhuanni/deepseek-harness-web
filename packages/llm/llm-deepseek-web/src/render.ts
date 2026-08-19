@@ -1,20 +1,17 @@
 /**
- * Render one fully-assembled dsh request into what the web composer receives.
+ * 把一次组装完毕的 dsh 请求渲染成网页输入框实际收到的内容。
  *
- * dsh owns the conversation; the page's memory of earlier turns is a cache, not
- * the authority. So a request is split by ROLE, never by transport:
+ * 对话由 dsh 拥有；页面对前面轮次的记忆只是缓存，不是权威副本。所以一次请求按
+ * **内容角色**切分，绝不按传输方式切分：
  *
- * - `preamble` is what the page must be *instructed* with on every turn. The
- *   page treats only composer text as an instruction, so this half can never
- *   move into an attachment, and an opening turn and a follow-up must produce
- *   the same one — otherwise resuming a conversation silently weakens it.
- * - `history` is conversation body. It may ride inline or as an attachment;
- *   that choice belongs to the adapter and must not change what the model is
- *   told.
+ * - `preamble` 是每轮都必须**指示**给页面的部分。页面只把输入框文本当指令，所以
+ *   这一半永远不能挪进附件，而且开场轮与续轮必须产出完全相同的一份——否则续用
+ *   一条网页对话就会悄悄削弱指令。
+ * - `history` 是对话正文。它可以并进输入框，也可以走附件；这个选择归适配器，且
+ *   不允许改变模型收到了哪些指令。
  *
- * Splitting by transport is what previously dropped the tool protocol from
- * every follow-up: the protocol lived in the attachment-only half, while short
- * increments never reached the attachment threshold.
+ * 按传输方式切分正是此前每个续轮都丢掉工具协议的原因：协议只存在于「走附件时」
+ * 那一半里，而增量续轮的内容短到永远够不到附件阈值。
  *
  * @module @deepseek-ai/dsh-llm-deepseek-web/render
  */
@@ -23,12 +20,10 @@ import type { ContentBlock, GenerateOptions, Message, ToolSchema } from '@deepse
 import { TOOL_CALL_CLOSE, TOOL_CALL_OPEN } from './parse.ts'
 
 /**
- * The closing instruction, shared by the opening turn and every follow-up.
+ * 收尾指令，开场轮与每个续轮共用同一份。
  *
- * It must not say "output only the reply itself": the near instruction outranks
- * the far one, so that phrasing reads as an instruction *against* emitting a
- * tool-call marker, and the model describes what it would do instead of doing
- * it.
+ * 它不能说「只输出回复本身」：近处的指令压过远处的，那句话会被读成**禁止**输出
+ * 工具调用标记，于是模型改成描述自己打算做什么，而不去做。
  */
 const TASK_INSTRUCTION = [
   '## 你的任务',
@@ -39,16 +34,14 @@ const TASK_INSTRUCTION = [
 ].join('\n')
 
 /**
- * The tool-call protocol, verbatim — the one text every surface repeats.
+ * 工具调用协议的逐字文本——每个出口都重复这同一份。
  *
- * It belongs to {@link RenderedRequest.preamble} because an attachment is read
- * as a document: the model takes the tool *catalog* from a document (it names
- * tools it could only have read there) while treating a *format* rule as prose
- * it may paraphrase, and a paraphrased call is an unparseable one.
+ * 它属于 {@link RenderedRequest.preamble}，因为附件是被当**文档**读的：模型能从
+ * 文档里拿到工具**目录**（它叫得出只可能来自那里的工具名），却把**格式**规则当成
+ * 可以转述的说明文字，而转述过的调用是解析不出来的。
  *
- * The JSON sits in a fenced block because the page renders markdown before we
- * read it back: outside a fence, `\"` renders as `"` and every call carrying a
- * quoted argument arrives as broken JSON.
+ * JSON 放在代码围栏里，是因为页面在我们读回之前会先渲染 markdown：围栏之外，
+ * `\"` 会被渲染成 `"`，于是每个带引号参数的调用到手都是坏 JSON。
  */
 const TOOL_CALL_PROTOCOL = [
   '需要调用工具时，严格按下面这段输出，不要改写格式，也不要只描述你打算做什么：',
@@ -64,7 +57,7 @@ const TOOL_CALL_PROTOCOL = [
   '- 一次可以连续输出多段工具调用',
 ].join('\n')
 
-/** Composer lead-in when the history rides as a file instead of inline. */
+/** 正文走附件而非并进输入框时，输入框里的引导语。 */
 export const ATTACHMENT_NOTE = '请阅读附件中的对话记录，然后按下面的要求作答。'
 
 /** Render the blocks of one message; unknown block types degrade to a labeled placeholder. */
@@ -123,11 +116,10 @@ function renderMessage(message: Message, index: number): string {
 }
 
 /**
- * The tool catalog: names, descriptions, and argument schemas.
+ * 工具目录：名称、描述与参数 schema。
  *
- * Body, not instruction — the model reads a catalog out of a document reliably,
- * so this may ride as an attachment. The call *format* does not; it lives in
- * {@link TOOL_CALL_PROTOCOL} and is stated once, in the preamble.
+ * 它属于正文而非指令——模型能可靠地从文档里读出目录，所以这部分可以走附件。调用
+ * **格式**不行；格式在 {@link TOOL_CALL_PROTOCOL}，只在 preamble 里陈述一次。
  */
 function renderTools(tools: readonly ToolSchema[]): string {
   const catalog = tools
@@ -137,15 +129,14 @@ function renderTools(tools: readonly ToolSchema[]): string {
   return ['## 可用工具', '', catalog].join('\n')
 }
 
-/** One request, split by content role. */
+/** 一次请求，按内容角色切成两半。 */
 export interface RenderedRequest {
   /**
-   * What must reach the composer every turn: the live question, the task
-   * instruction, and the call protocol. Identical for an opening turn and a
-   * follow-up, which is what makes conversation resumption semantics-preserving.
+   * 每轮都必须进到输入框的内容：当前提问、任务要求、调用协议。开场轮与续轮完全
+   * 一致——正是这一点让「续用网页对话」成为不改变语义的优化。
    */
   preamble: string
-  /** Conversation body — inline or attached, the adapter's choice. */
+  /** 对话正文——并进输入框还是走附件，由适配器决定。 */
   history: string
 }
 
@@ -165,15 +156,14 @@ function lastUserQuestion(messages: readonly Message[]): Message | undefined {
 }
 
 /**
- * The instruction half, identical on every turn of a conversation.
+ * 指令那一半，一条对话的每一轮都完全相同。
  *
- * The question is restated here rather than left to the history because one
- * turn spans many steps: from the second step on, the history increment holds
- * only tool output, and a question that is no longer in front of the model gets
- * answered loosely (listing entries when asked to count them).
+ * 提问在这里重述一遍而不是交给历史，是因为一轮会跨多个 step：从第二个 step 起，
+ * 历史增量里只有工具输出，而提问一旦不在模型眼前，回答就会走样（问「有几个」时
+ * 只把条目列一遍，不报数）。
  *
- * @param options - the request whose question and task this describes.
- * @returns composer-bound text.
+ * @param options - 提供本轮提问与任务的请求。
+ * @returns 归输入框承载的文本。
  */
 function buildPreamble(options: GenerateOptions): string {
   const sections: string[] = []
@@ -184,15 +174,14 @@ function buildPreamble(options: GenerateOptions): string {
 }
 
 /**
- * Render only the turns the web conversation has not seen yet.
+ * 只渲染网页对话还没见过的那些轮次。
  *
- * Assistant turns are skipped: the page produced them and already holds them.
- * The catalog is not re-sent either — the opening turn gave it in this same web
- * conversation, and `resumeBlocker` guarantees the tool set has not changed.
+ * assistant 轮跳过：页面自己产出的，它本来就有。目录也不重发——开场轮已在同一条
+ * 网页对话里给过，而 `resumeBlocker` 保证工具集没有变化。
  *
- * @param options - the full request; only the tail past `fromIndex` is used.
- * @param fromIndex - how many leading messages the page already holds.
- * @returns the incremental request, or null when nothing new needs sending.
+ * @param options - 完整请求；只用到 `fromIndex` 之后的尾部。
+ * @param fromIndex - 页面已经持有的前置消息条数。
+ * @returns 增量请求；没有新内容需要发送时返回 null。
  */
 export function renderIncrement(
   options: GenerateOptions,
@@ -207,10 +196,10 @@ export function renderIncrement(
 }
 
 /**
- * Render a full request for a web conversation that holds nothing yet.
+ * 为一条尚无任何历史的网页对话渲染完整请求。
  *
- * @param options - the request to render.
- * @returns the opening request; its preamble equals a follow-up's.
+ * @param options - 待渲染的请求。
+ * @returns 开场请求；它的 preamble 与续轮的完全相同。
  */
 export function renderRequest(options: GenerateOptions): RenderedRequest {
   const sections: string[] = []

@@ -119,14 +119,32 @@ pnpm install
 if ($LASTEXITCODE -ne 0) { Stop-Setup 'pnpm install 失败' }
 Write-Ok '依赖就绪'
 
+# 产物「存在」不等于「是最新的」:插件以 main: lib/index.js 被 Node 加载,改了 src
+# 却不重建,跑起来仍是旧代码,而进度显示成功 —— 最难查的一类问题。只看 src:
+# tsdown 只打包它,测试文件改动不影响产物。
+function Get-StaleSource {
+    $stamp = (Get-Item 'apps/cli/lib/bin.js').LastWriteTimeUtc
+    return Get-ChildItem -Path 'packages', 'apps' -Recurse -Filter '*.ts' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notlike '*\node_modules\*' -and $_.FullName -like '*\src\*' -and $_.LastWriteTimeUtc -gt $stamp } |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
 Write-Step 4 '构建'
-if (-not $Rebuild -and (Test-Path 'apps/cli/lib/bin.js') -and (Test-Path 'apps/web/dist/index.html')) {
-  Write-Ok '产物已存在，跳过（-Rebuild 可强制重建）'
+$needsBuild = $true
+if ($Rebuild) {
+    Write-Note '强制重建'
+} elseif (-not (Test-Path 'apps/cli/lib/bin.js') -or -not (Test-Path 'apps/web/dist/index.html')) {
+    Write-Note '尚无构建产物'
 } else {
-  Write-Note '首次构建需要数分钟'
-  pnpm run build
-  if ($LASTEXITCODE -ne 0) { Stop-Setup '构建失败' }
-  Write-Ok '构建完成'
+    $stale = Get-StaleSource
+    if ($stale) { Write-Note "源码已改动（$stale 等），产物过期，重新构建" }
+    else { Write-Ok '产物是最新的，跳过'; $needsBuild = $false }
+}
+if ($needsBuild) {
+    Write-Note '全量构建需要数分钟'
+    pnpm run build
+    if ($LASTEXITCODE -ne 0) { Stop-Setup '构建失败' }
+    Write-Ok '构建完成'
 }
 
 Write-Step 5 "把 llm-deepseek-web 挂进 profile：$Profile_"

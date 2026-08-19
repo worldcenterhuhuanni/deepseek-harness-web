@@ -17,6 +17,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
+import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { DEFAULT_INLINE_LIMIT, DsWebAdapter } from './adapter.ts'
 import { WebSession } from './session.ts'
@@ -44,16 +46,30 @@ export const DEFAULT_CDP_ENDPOINT = 'http://127.0.0.1:9222'
 const NS = settingsNamespace('llm-deepseek-web')
 
 export interface Config {
+  /** 要驱动的 Chrome 调试端口地址。 */
   endpoint: string
+  /** 端口无响应时，拉起一个带独立 profile 的 Chrome。 */
   autoLaunch: boolean
+  /** 自动启动时使用的浏览器 profile 目录；留空表示 `$DSH_HOME/deepseek-web-profile`。 */
   userDataDir: string
+  /** Chrome 可执行文件路径；留空表示自动探测，`CHROME_PATH` 环境变量同样生效。 */
   chromePath: string
+  /** 对话正文超过该字符数时改走 `.md` 附件，而不是并进输入框文本。 */
   inlineLimit: number
+  /** 是否允许走附件；关掉则一切内容都留在输入框里。 */
   useAttachment: boolean
+  /** 页面可以多久没有任何动静，超过即判本轮失败。 */
   idleTimeoutMs: number
+  /** 单轮的绝对上限，与页面是否有动静无关。 */
   hardTimeoutMs: number
+  /** 是否开启站点的「深度思考」，它会显著拖长首字延迟。 */
   deepThinking: boolean
+  /** 是否开启站点的「智能搜索」；站点默认是开的，每轮要多花数十秒。 */
   webSearch: boolean
+  /** 随本 provider 路由一起捕获的重试策略；不填表示沿用 seam 默认。 */
+  retryPolicy?: RetryPolicyConfig
+  /** 工具调用解析不出时，按可重试失败处理，而不是当成一个已完成的回合。 */
+  retryOnUnparsableCall: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -75,6 +91,9 @@ export const Config: z<Config> = z.object({
     .description('单轮等待的绝对上限。'),
   deepThinking: z.boolean().default(false)
     .description('是否开启网页端「深度思考」。开启会显著拉长首字延迟。'),
+  retryPolicy: RetryPolicySchema,
+  retryOnUnparsableCall: z.boolean().default(true)
+    .description('模型写出的调用完全解析不出时，按重试策略重发本轮请求，而不是把回合当成已完成。'),
   webSearch: z.boolean().default(false)
     .description('是否开启网页端「智能搜索」。站点默认开启，但每轮联网搜索会让首字延迟高达 30 秒以上。'),
 })
@@ -99,6 +118,9 @@ export function apply(ctx: Context, config: Config): void {
     session,
     inlineLimit: () => current().inlineLimit,
     useAttachment: () => current().useAttachment,
+    // 每次请求现读:设置里改了策略,下一次调用即生效。
+    retryPolicy: () => resolveRetryPolicy(current().retryPolicy, `${NS}: retryPolicy`),
+    retryOnUnparsableCall: () => current().retryOnUnparsableCall,
     // 网页那边意外多出一堆独立对话时,这条日志是唯一能说清为什么的东西。
     log: (message, level) => {
       const line = `llm-deepseek-web: ${message}`

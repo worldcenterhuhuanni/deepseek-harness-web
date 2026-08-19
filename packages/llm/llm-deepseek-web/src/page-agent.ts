@@ -18,12 +18,11 @@ export interface PageSnapshot {
   /** Composer text matched an upload/parse failure hint. */
   failed: string
   /**
-   * A failure hint found OUTSIDE the composer, when none was found inside it.
+   * 在输入区**之外**命中的失败提示，且仅当输入区内没有命中时才填。
    *
-   * Never a failure verdict: the transcript is page text too, so a task that
-   * merely discusses 「解析失败」 would match forever. Reported only when the
-   * attach wait times out, where it is the sole clue that the site put a real
-   * notice somewhere this scope does not reach.
+   * 它永远不构成失败判定：对话记录同样是页面文本，一个只是在讨论「解析失败」的
+   * 任务会永久命中。只在等待附件超时的那一刻上报，那时它是「站点把真提示贴在本
+   * 范围之外」的唯一线索。
    */
   failedElsewhere: string
   /** An attachment is still uploading or parsing. */

@@ -46,3 +46,6 @@ worktrees/
 .itp/dialogue.jsonl
 .itp/decisions.jsonl
 .itp/confirmations.jsonl
+
+# ITP 本地产物（config.json 需要提交；dialogue.jsonl 含对话原文，勿提交）
+.codegraph/
